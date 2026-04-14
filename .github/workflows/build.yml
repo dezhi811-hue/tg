@@ -10,10 +10,10 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.9'
 
@@ -33,18 +33,18 @@ jobs:
           copy 使用说明.txt release\
 
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: TelegramFilter-Windows
           path: release/
 
   build-macos-intel:
-    runs-on: macos-13
+    runs-on: macos-12
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.9'
 
@@ -64,7 +64,7 @@ jobs:
           cp 使用说明.txt release/
 
       - name: Upload macOS artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: TelegramFilter-macOS-Intel
           path: release/
@@ -75,13 +75,13 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - name: Download Windows artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: TelegramFilter-Windows
           path: windows-release
 
       - name: Download macOS artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: TelegramFilter-macOS-Intel
           path: macos-release
