@@ -11,29 +11,31 @@
    - 创建应用，获取 api_id 和 api_hash
 
 2. 配置账号信息
-   - 复制 config_example.json 为 config.json
+   - 复制 config.example.json 为 config.json
    - 编辑 config.json，填入：
      * api_id: 你的 API ID（数字）
      * api_hash: 你的 API Hash（字符串）
-     * phone: 你的手机号（带国家码，如 +8613800138000）
 
-   - 如果需要代理，填写 proxy 部分：
-     * host: 代理地址（如 127.0.0.1）
-     * port: 代理端口（如 1080）
-     * username: 代理用户名（可选）
-     * password: 代理密码（可选）
+   - 如果需要代理，填写 proxy 部分（可选）
 
-3. 启动程序
+3. 登录 Telegram 账号
+   - Windows: 双击 TelegramLogin.exe
+   - macOS: 双击 TelegramLogin.app
+
+   - 填写信息：
+     * API ID 和 API Hash（会自动从 config.json 读取）
+     * 手机号（带国家码，如 +8613800138000）
+     * Session 名称（如 session_1）
+     * 代理（可选）
+
+   - 点击"开始登录"
+   - 输入 Telegram 发送的验证码
+   - 如果有两步验证，输入密码
+   - 登录成功后会生成 session_*.session 文件
+
+4. 启动主程序
    - Windows: 双击 TelegramFilter.exe
    - macOS: 双击 TelegramFilter.app
-
-4. 首次登录
-   - 程序会提示"检测到未登录账号"
-   - 点击"是"开始登录
-   - 点击"开始登录"按钮
-   - 在手机上收到验证码后，输入验证码
-   - 如果设置了两步验证，输入密码
-   - 登录成功后会自动保存 session 文件
 
 5. 开始筛选
    - 在"筛选"标签页输入或导入手机号
@@ -44,8 +46,10 @@
 
 📁 文件说明：
 
+TelegramLogin.exe / TelegramLogin.app - 登录工具（首次使用）
+TelegramFilter.exe / TelegramFilter.app - 主程序
 config.json - 账号配置文件（必需）
-session_*.session - 登录会话文件（自动生成）
+session_*.session - 登录会话文件（登录工具自动生成）
 registered_*.txt - 已注册号码导出文件
 unregistered_*.txt - 未注册号码导出文件
 filter_progress.json - 筛选进度文件
