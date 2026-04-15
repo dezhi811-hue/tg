@@ -80,7 +80,7 @@ else:
         console=False,
         disable_windowed_traceback=False,
         argv_emulation=False,
-        target_arch='universal2',  # 通用二进制，同时支持 Intel 和 Apple Silicon
+        target_arch=None,
         codesign_identity=None,
         entitlements_file=None,
     )
@@ -94,5 +94,6 @@ else:
         info_plist={
             'NSHighResolutionCapable': 'True',
             'LSBackgroundOnly': 'False',
+            'LSMinimumSystemVersion': '11.0',  # 最低支持 macOS 11
         },
     )
