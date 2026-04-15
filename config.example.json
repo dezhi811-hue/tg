@@ -26,8 +26,9 @@
     }
   ],
   "rate_limit": {
-    "requests_per_account": 20,
-    "min_delay": 3,
-    "max_delay": 8
+    "requests_per_account": 50,
+    "min_delay": 1,
+    "max_delay": 4,
+    "error_cooldown": 30
   }
 }

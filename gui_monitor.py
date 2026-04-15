@@ -688,9 +688,14 @@ class FilterThread(QThread):
                             else:
                                 self.log_signal.emit(f"  ✅ 已注册 | {display_phone} | {status_text}{retry_suffix}")
                         else:
+                            # 先判断结果类型，只有 uncertain 状态才需要复核
+                            classification, message = self.describe_non_registered_result(result, environment_unstable)
+
                             active_primary = manager.get_active_primary_accounts()
                             conflict_handled = False
-                            if len(active_primary) >= 2:
+
+                            # 只在 uncertain 状态且有多个账号时才复核
+                            if classification == 'uncertain' and len(active_primary) >= 2:
                                 first_primary = active_primary[0]
                                 second_primary = active_primary[1]
                                 second_result = await self.query_with_account(filter_obj, second_primary, phone, self.country)
@@ -753,7 +758,7 @@ class FilterThread(QThread):
                                             len(self.phones)
                                         )
                                     else:
-                                        classification, message = self.describe_non_registered_result(result, environment_unstable)
+                                        # 三级复核后仍未确认
                                         if classification == 'unregistered':
                                             unregistered_count += 1
                                             self.log_signal.emit(f"  ❌ 未注册 | {display_phone} | {message}")
@@ -763,7 +768,7 @@ class FilterThread(QThread):
                                             uncertain_count += 1
                                             self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
                                 else:
-                                    classification, message = self.describe_non_registered_result(result, environment_unstable)
+                                    # 二级复核后仍未确认
                                     if classification == 'unregistered':
                                         unregistered_count += 1
                                         self.log_signal.emit(f"  ❌ 未注册 | {display_phone} | {message}")
@@ -772,14 +777,14 @@ class FilterThread(QThread):
                                     else:
                                         uncertain_count += 1
                                         self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
-                            if not active_primary or (len(active_primary) < 2 and not conflict_handled):
-                                classification, message = self.describe_non_registered_result(result, environment_unstable)
+                            else:
+                                # 不需要复核，直接记录结果
                                 if classification == 'unregistered':
                                     unregistered_count += 1
                                     self.log_signal.emit(f"  ❌ 未注册 | {display_phone} | {message}")
                                 elif classification == 'invalid':
                                     self.log_signal.emit(f"  ⚠️ 号码无效 | {display_phone}")
-                                elif not conflict_handled:
+                                else:
                                     uncertain_count += 1
                                     self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
 
