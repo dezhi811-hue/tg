@@ -622,6 +622,70 @@ class FilterThread(QThread):
         final_result['error'] = '连续空返回，结果未确认'
         return final_result
 
+    async def process_single_phone(self, phone_idx, phone, worker, manager,
+                                   progress_lock, registered_batch, registered_file_index,
+                                   environment_unstable, probe_failure_count):
+        """处理单个号码（并发调用）"""
+        import random
+
+        # 添加随机延迟，避免多个账号同时发起请求
+        random_delay = random.uniform(0.1, 0.5)
+        await asyncio.sleep(random_delay)
+
+        self.log_signal.emit(f"[{phone_idx+1}/{len(self.phones)}] 检查 {phone} (账号: {worker['account']['name']})")
+
+        try:
+            result = await self.resolve_phone_result(worker['filter'], phone, self.country)
+            display_phone = self.get_display_phone(result, phone)
+
+            if result['registered']:
+                status_text = result.get('status') or 'unknown'
+                last_seen = result.get('last_seen')
+                retry_suffix = ''
+                if result.get('recovered_after_retry'):
+                    retry_suffix = f" | 复查后成功({result.get('retry_attempts')})"
+                if last_seen:
+                    self.log_signal.emit(f"  ✅ 已注册 | {display_phone} | {status_text} | {last_seen}{retry_suffix}")
+                else:
+                    self.log_signal.emit(f"  ✅ 已注册 | {display_phone} | {status_text}{retry_suffix}")
+                return result
+            else:
+                # 判断结果类型
+                classification, message = self.describe_non_registered_result(result, environment_unstable)
+
+                # 只在 uncertain 状态才复核
+                if classification == 'uncertain':
+                    active_primary = manager.get_active_primary_accounts()
+                    if len(active_primary) >= 2:
+                        # 使用其他账号复核
+                        for verify_account in active_primary[1:]:
+                            if verify_account['name'] == worker['account']['name']:
+                                continue
+                            verify_result = await self.query_with_account(worker['filter'], verify_account, phone, self.country)
+                            if verify_result.get('registered'):
+                                verify_display = self.get_display_phone(verify_result, phone)
+                                verify_status = verify_result.get('status') or 'unknown'
+                                verify_last_seen = verify_result.get('last_seen')
+                                if verify_last_seen:
+                                    self.log_signal.emit(f"  ✅ 复核命中 | {verify_account['name']} | {verify_display} | {verify_status} | {verify_last_seen}")
+                                else:
+                                    self.log_signal.emit(f"  ✅ 复核命中 | {verify_account['name']} | {verify_display} | {verify_status}")
+                                return verify_result
+
+                # 记录未注册结果
+                result['classification'] = classification
+                if classification == 'unregistered':
+                    self.log_signal.emit(f"  ❌ 未注册 | {display_phone} | {message}")
+                elif classification == 'invalid':
+                    self.log_signal.emit(f"  ⚠️ 号码无效 | {display_phone}")
+                else:
+                    self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
+                return result
+
+        except Exception as e:
+            self.log_signal.emit(f"  ⚠️ 错误: {str(e)}")
+            return None
+
     def describe_non_registered_result(self, result, environment_unstable):
         query_state = result.get('query_state')
         if query_state == 'invalid':
@@ -639,7 +703,7 @@ class FilterThread(QThread):
         return 'uncertain', result.get('error') or '结果未确认'
 
     async def filter_task(self):
-        """异步筛选任务"""
+        """异步筛选任务 - 多账号并发版本"""
         from account_manager import AccountManager
         from filter import TelegramFilter
         from rate_limiter import RateLimiter
@@ -652,8 +716,25 @@ class FilterThread(QThread):
             manager = AccountManager(config_path)
             await manager.connect_all()
 
-            limiter = RateLimiter(self.config['rate_limit'])
-            filter_obj = TelegramFilter(manager, limiter)
+            # 获取活跃的primary账号
+            active_primary = manager.get_active_primary_accounts()
+            if not active_primary:
+                self.log_signal.emit("❌ 没有可用的primary账号")
+                return
+
+            concurrent_workers = len(active_primary)
+            self.log_signal.emit(f"🔥 启用 {concurrent_workers} 个账号并发查询")
+
+            # 为每个账号创建独立的limiter和filter
+            workers = []
+            for account in active_primary:
+                limiter = RateLimiter(self.config['rate_limit'])
+                filter_obj = TelegramFilter(manager, limiter)
+                workers.append({
+                    'account': account,
+                    'limiter': limiter,
+                    'filter': filter_obj
+                })
 
             results = []
             progress = self.load_progress()
@@ -678,143 +759,60 @@ class FilterThread(QThread):
                 if start_index > 0:
                     self.log_signal.emit(f"📂 检测到上次进度，从第 {start_index + 1} 条继续")
 
-            for i in range(start_index, len(self.phones)):
-                phone = self.phones[i]
+            # 使用锁保护共享变量
+            import asyncio
+            progress_lock = asyncio.Lock()
+
+            # 并发处理号码
+            batch_size = concurrent_workers
+            for batch_start in range(start_index, len(self.phones), batch_size):
                 if not self.running:
                     break
 
-                self.log_signal.emit(f"[{i+1}/{len(self.phones)}] 检查 {phone}")
+                batch_end = min(batch_start + batch_size, len(self.phones))
+                batch_phones = [(i, self.phones[i]) for i in range(batch_start, batch_end)]
 
-                for attempt in range(1, self.MAX_RETRIES + 1):
-                    try:
-                        result = await self.resolve_phone_result(filter_obj, phone, self.country)
-                        results.append(result)
+                # 为每个号码分配一个worker
+                tasks = []
+                for idx, (phone_idx, phone) in enumerate(batch_phones):
+                    worker = workers[idx % concurrent_workers]
+                    task = self.process_single_phone(
+                        phone_idx, phone, worker, manager,
+                        progress_lock, registered_batch, registered_file_index,
+                        environment_unstable, probe_failure_count
+                    )
+                    tasks.append(task)
 
-                        status = self.get_account_status(manager)
-                        self.status_signal.emit(status)
+                # 并发执行这一批
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                        display_phone = self.get_display_phone(result, phone)
+                # 处理结果
+                for phone_idx, result in zip([p[0] for p in batch_phones], batch_results):
+                    if isinstance(result, Exception):
+                        self.log_signal.emit(f"  ⚠️ 处理异常: {str(result)}")
+                        continue
 
-                        if result['registered']:
+                    if result is None:
+                        continue
+
+                    async with progress_lock:
+                        if result.get('registered'):
                             registered_count += 1
                             registered_batch.append(self.build_registered_entry(result))
                             if len(registered_batch) >= self.REGISTERED_CHUNK_SIZE:
                                 self.save_registered_chunk(registered_batch, registered_file_index)
                                 registered_batch = []
                                 registered_file_index += 1
-
-                            status_text = result.get('status') or 'unknown'
-                            last_seen = result.get('last_seen')
-                            retry_suffix = ''
-                            if result.get('recovered_after_retry'):
-                                retry_suffix = f" | 复查后成功({result.get('retry_attempts')})"
-                            if last_seen:
-                                self.log_signal.emit(f"  ✅ 已注册 | {display_phone} | {status_text} | {last_seen}{retry_suffix}")
-                            else:
-                                self.log_signal.emit(f"  ✅ 已注册 | {display_phone} | {status_text}{retry_suffix}")
                         else:
-                            # 先判断结果类型，只有 uncertain 状态才需要复核
-                            classification, message = self.describe_non_registered_result(result, environment_unstable)
+                            classification = result.get('classification', 'uncertain')
+                            if classification == 'unregistered':
+                                unregistered_count += 1
+                            elif classification == 'uncertain':
+                                uncertain_count += 1
 
-                            active_primary = manager.get_active_primary_accounts()
-                            conflict_handled = False
-
-                            # 只在 uncertain 状态且有多个账号时才复核
-                            if classification == 'uncertain' and len(active_primary) >= 2:
-                                first_primary = active_primary[0]
-                                second_primary = active_primary[1]
-                                second_result = await self.query_with_account(filter_obj, second_primary, phone, self.country)
-                                if second_result.get('registered'):
-                                    conflict_handled = True
-                                    registered_count += 1
-                                    registered_batch.append(self.build_registered_entry(second_result))
-                                    if len(registered_batch) >= self.REGISTERED_CHUNK_SIZE:
-                                        self.save_registered_chunk(registered_batch, registered_file_index)
-                                        registered_batch = []
-                                        registered_file_index += 1
-
-                                    second_display_phone = self.get_display_phone(second_result, phone)
-                                    second_status = second_result.get('status') or 'unknown'
-                                    second_last_seen = second_result.get('last_seen')
-                                    if second_last_seen:
-                                        self.log_signal.emit(f"  ✅ 复核命中 | {second_primary['name']} | {second_display_phone} | {second_status} | {second_last_seen}")
-                                    else:
-                                        self.log_signal.emit(f"  ✅ 复核命中 | {second_primary['name']} | {second_display_phone} | {second_status}")
-
-                                    await self.handle_account_conflict(
-                                        manager,
-                                        filter_obj,
-                                        first_primary,
-                                        second_primary,
-                                        phone,
-                                        second_result,
-                                        i + 1,
-                                        len(self.phones)
-                                    )
-                                elif len(active_primary) >= 3:
-                                    third_primary = active_primary[2]
-                                    third_result = await self.query_with_account(filter_obj, third_primary, phone, self.country)
-                                    if third_result.get('registered'):
-                                        conflict_handled = True
-                                        manager.mark_account_suspected(second_primary, f"miss_before:{third_primary['name']}")
-                                        registered_count += 1
-                                        registered_batch.append(self.build_registered_entry(third_result))
-                                        if len(registered_batch) >= self.REGISTERED_CHUNK_SIZE:
-                                            self.save_registered_chunk(registered_batch, registered_file_index)
-                                            registered_batch = []
-                                            registered_file_index += 1
-
-                                        third_display_phone = self.get_display_phone(third_result, phone)
-                                        third_status = third_result.get('status') or 'unknown'
-                                        third_last_seen = third_result.get('last_seen')
-                                        if third_last_seen:
-                                            self.log_signal.emit(f"  ✅ 三级复核命中 | {first_primary['name']} 未命中 -> {second_primary['name']} 未命中 -> {third_primary['name']} 命中 | {third_display_phone} | {third_status} | {third_last_seen}")
-                                        else:
-                                            self.log_signal.emit(f"  ✅ 三级复核命中 | {first_primary['name']} 未命中 -> {second_primary['name']} 未命中 -> {third_primary['name']} 命中 | {third_display_phone} | {third_status}")
-
-                                        await self.handle_account_conflict(
-                                            manager,
-                                            filter_obj,
-                                            first_primary,
-                                            third_primary,
-                                            phone,
-                                            third_result,
-                                            i + 1,
-                                            len(self.phones)
-                                        )
-                                    else:
-                                        # 三级复核后仍未确认
-                                        if classification == 'unregistered':
-                                            unregistered_count += 1
-                                            self.log_signal.emit(f"  ❌ 未注册 | {display_phone} | {message}")
-                                        elif classification == 'invalid':
-                                            self.log_signal.emit(f"  ⚠️ 号码无效 | {display_phone}")
-                                        else:
-                                            uncertain_count += 1
-                                            self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
-                                else:
-                                    # 二级复核后仍未确认
-                                    if classification == 'unregistered':
-                                        unregistered_count += 1
-                                        self.log_signal.emit(f"  ❌ 未注册 | {display_phone} | {message}")
-                                    elif classification == 'invalid':
-                                        self.log_signal.emit(f"  ⚠️ 号码无效 | {display_phone}")
-                                    else:
-                                        uncertain_count += 1
-                                        self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
-                            else:
-                                # 不需要复核，直接记录结果
-                                if classification == 'unregistered':
-                                    unregistered_count += 1
-                                    self.log_signal.emit(f"  ❌ 未注册 | {display_phone} | {message}")
-                                elif classification == 'invalid':
-                                    self.log_signal.emit(f"  ⚠️ 号码无效 | {display_phone}")
-                                else:
-                                    uncertain_count += 1
-                                    self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
-
+                        # 保存进度
                         self.save_progress(
-                            i + 1,
+                            phone_idx + 1,
                             registered_count,
                             unregistered_count,
                             registered_batch,
@@ -823,35 +821,20 @@ class FilterThread(QThread):
                             environment_unstable,
                             probe_failure_count
                         )
-                        break
-                    except Exception as e:
-                        error_text = str(e)
-                        if attempt < self.MAX_RETRIES and any(key in error_text.lower() for key in ['reset by peer', 'server closed', 'timed out', 'connection', 'timeout']):
-                            self.log_signal.emit(f"  ⚠️ 网络异常，第 {attempt} 次重试")
-                            await self.reconnect_manager(manager)
-                            continue
-                        self.log_signal.emit(f"  ⚠️ 错误: {error_text}")
-                        self.save_progress(
-                            i,
-                            registered_count,
-                            unregistered_count,
-                            registered_batch,
-                            registered_file_index,
-                            uncertain_count,
-                            environment_unstable,
-                            probe_failure_count
-                        )
-                        await manager.disconnect_all()
-                        return
 
-                # ── 探针验证：每隔 N 个号静默检查一次 ──
+                # 更新账号状态
+                status = self.get_account_status(manager)
+                self.status_signal.emit(status)
+
+                # 探针检测（每批次后检测一次）
                 if self.running and self.probe_interval > 0 and self.probe_phones:
-                    probe_idx = (i + 1) // self.probe_interval
-                    if (i + 1) % self.probe_interval == 0 and probe_idx > 0:
+                    probe_idx = (batch_end) // self.probe_interval
+                    if batch_end % self.probe_interval == 0 and probe_idx > 0:
                         probe_phone = self.probe_phones[(probe_idx - 1) % len(self.probe_phones)]
                         self.log_signal.emit(f"[探针{probe_idx}] 验证 {probe_phone}...")
                         try:
-                            probe_result = await self.resolve_phone_result(filter_obj, probe_phone, self.country)
+                            # 使用第一个worker的filter进行探针检测
+                            probe_result = await self.resolve_phone_result(workers[0]['filter'], probe_phone, self.country)
                             probe_original = probe_result.get('original_phone') or probe_phone
                             probe_formatted = probe_result.get('phone') or probe_phone
                             probe_display = probe_formatted if probe_formatted == probe_original else f"{probe_original} -> {probe_formatted}"
@@ -869,22 +852,10 @@ class FilterThread(QThread):
                                 self.log_signal.emit(f"  [探针{probe_idx}] ❓ {probe_display} 未确认 | {probe_message}")
                                 if environment_unstable:
                                     self.log_signal.emit(f"  [探针{probe_idx}] ⚠️ 当前查询环境已标记为不稳定")
-
-                                # 发射探针异常信号，停止筛选
-                                self.probe_anomaly_signal.emit(probe_phone, i + 1, len(self.phones))
-                                self.running = False
-                                self.save_progress(
-                                    i,
-                                    registered_count,
-                                    unregistered_count,
-                                    registered_batch,
-                                    registered_file_index,
-                                    uncertain_count,
-                                    environment_unstable,
-                                    probe_failure_count
-                                )
-                                await manager.disconnect_all()
-                                return
+                                    self.probe_anomaly_signal.emit(probe_phone, batch_end, len(self.phones))
+                                    self.running = False
+                                    await manager.disconnect_all()
+                                    return
                         except Exception as e:
                             probe_failure_count += 1
                             environment_unstable = probe_failure_count >= self.PROBE_FAILURE_THRESHOLD

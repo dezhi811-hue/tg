@@ -14,12 +14,16 @@ class RateLimiter:
         self.last_error_time = None
 
     async def wait_before_request(self):
-        """请求前等待（智能延迟）"""
-        # 基础随机延迟
+        """请求前等待（智能延迟 + 随机间隔）"""
+        # 基础随机延迟（增加随机性，避免固定间隔）
         base_delay = random.uniform(
             self.config['min_delay'],
             self.config['max_delay']
         )
+
+        # 额外的随机抖动，避免多账号同步
+        jitter = random.uniform(0, 0.5)
+        base_delay += jitter
 
         # 如果最近有错误，增加延迟
         if self.last_error_time:
