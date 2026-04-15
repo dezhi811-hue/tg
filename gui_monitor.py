@@ -295,7 +295,10 @@ class FilterThread(QThread):
         try:
             asyncio.run(self.filter_task())
         except Exception as e:
-            self.log_signal.emit(f"❌ 错误: {str(e)}")
+            import traceback
+            error_msg = f"❌ 筛选任务异常: {translate_error_message(str(e))}"
+            self.log_signal.emit(error_msg)
+            self.log_signal.emit(f"详细错误: {traceback.format_exc()}")
         finally:
             self.finished_signal.emit()
 
@@ -529,14 +532,16 @@ class FilterThread(QThread):
         from filter import TelegramFilter
         from rate_limiter import RateLimiter
 
-        self.log_signal.emit(f"🚀 开始筛选 {len(self.phones)} 个号码")
+        manager = None
+        try:
+            self.log_signal.emit(f"🚀 开始筛选 {len(self.phones)} 个号码")
 
-        # 初始化管理器
-        manager = AccountManager(config_path)
-        await manager.connect_all()
+            # 初始化管理器
+            manager = AccountManager(config_path)
+            await manager.connect_all()
 
-        limiter = RateLimiter(self.config['rate_limit'])
-        filter_obj = TelegramFilter(manager, limiter)
+            limiter = RateLimiter(self.config['rate_limit'])
+            filter_obj = TelegramFilter(manager, limiter)
 
         results = []
         progress = self.load_progress()
@@ -755,11 +760,21 @@ class FilterThread(QThread):
         if registered_batch:
             self.save_registered_chunk(registered_batch, registered_file_index)
 
-        await manager.disconnect_all()
         self.clear_progress()
         self.log_signal.emit(
             f"✅ 筛选完成！共 {len(self.phones)} 个号码，已注册 {registered_count} 个，未确认 {uncertain_count} 个，未注册 {unregistered_count} 个"
         )
+
+        except Exception as e:
+            import traceback
+            self.log_signal.emit(f"❌ 筛选过程出错: {translate_error_message(str(e))}")
+            self.log_signal.emit(f"详细错误: {traceback.format_exc()}")
+        finally:
+            if manager:
+                try:
+                    await manager.disconnect_all()
+                except Exception as e:
+                    self.log_signal.emit(f"⚠️ 断开连接时出错: {str(e)}")
 
     def get_account_status(self, manager):
         """获取所有账号的状态"""
