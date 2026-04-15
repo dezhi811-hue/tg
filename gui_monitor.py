@@ -191,61 +191,74 @@ class AccountCheckThread(QThread):
                 'proxy_state': 'not_configured'
             }
 
-            proxy = account.get('proxy', {})
-            proxy_config = None
-            if proxy and proxy.get('host'):
-                proxy_config = ('socks5', proxy['host'], proxy['port'],
-                              proxy.get('username') or None, proxy.get('password') or None)
-                proxy_client = None
-                try:
-                    proxy_client = TelegramClient(
-                        f"session_{name}_proxy_check",
-                        int(account['api_id']),
-                        account['api_hash'],
-                        proxy=proxy_config
-                    )
-                    await proxy_client.connect()
-                    if proxy_client.is_connected():
-                        status['proxy_state'] = 'proxy_ok'
-                        self.log_signal.emit(f"🟢 账号 {name} 代理连接成功")
-                    else:
-                        status['proxy_state'] = 'proxy_failed'
-                        status['proxy_error'] = '代理连接失败'
-                        self.log_signal.emit(f"🔴 账号 {name} 代理连接失败")
-                except Exception as e:
-                    status['proxy_state'] = 'proxy_failed'
-                    status['proxy_error'] = translate_error_message(str(e))
-                    self.log_signal.emit(f"🔴 账号 {name} 代理失败: {status['proxy_error']}")
-                finally:
-                    if proxy_client:
-                        await proxy_client.disconnect()
-            else:
-                self.log_signal.emit(f"⚪ 账号 {name} 未配置代理")
-
-            client = TelegramClient(
-                f"session_{name}",
-                int(account['api_id']),
-                account['api_hash'],
-                proxy=proxy_config
-            )
             try:
-                await client.connect()
-                if not client.is_connected():
-                    status['login_state'] = 'failed'
-                    status['login_error'] = '连接 Telegram 失败'
-                    self.log_signal.emit(f"🔴 账号 {name} 登录检测失败: 连接 Telegram 失败")
-                elif await client.is_user_authorized():
-                    status['login_state'] = 'logged_in'
-                    self.log_signal.emit(f"🟢 账号 {name} 已登录")
+                proxy = account.get('proxy', {})
+                proxy_config = None
+                if proxy and proxy.get('host'):
+                    proxy_config = ('socks5', proxy['host'], proxy['port'],
+                                  proxy.get('username') or None, proxy.get('password') or None)
+                    proxy_client = None
+                    try:
+                        proxy_client = TelegramClient(
+                            f"session_{name}_proxy_check",
+                            int(account['api_id']),
+                            account['api_hash'],
+                            proxy=proxy_config
+                        )
+                        await proxy_client.connect()
+                        if proxy_client.is_connected():
+                            status['proxy_state'] = 'proxy_ok'
+                            self.log_signal.emit(f"🟢 账号 {name} 代理连接成功")
+                        else:
+                            status['proxy_state'] = 'proxy_failed'
+                            status['proxy_error'] = '代理连接失败'
+                            self.log_signal.emit(f"🔴 账号 {name} 代理连接失败")
+                    except Exception as e:
+                        status['proxy_state'] = 'proxy_failed'
+                        status['proxy_error'] = translate_error_message(str(e))
+                        self.log_signal.emit(f"🔴 账号 {name} 代理失败: {status['proxy_error']}")
+                    finally:
+                        if proxy_client:
+                            try:
+                                await proxy_client.disconnect()
+                            except:
+                                pass
                 else:
-                    status['login_state'] = 'not_logged_in'
-                    self.log_signal.emit(f"⚪ 账号 {name} 未登录")
+                    self.log_signal.emit(f"⚪ 账号 {name} 未配置代理")
+
+                client = TelegramClient(
+                    f"session_{name}",
+                    int(account['api_id']),
+                    account['api_hash'],
+                    proxy=proxy_config
+                )
+                try:
+                    await client.connect()
+                    if not client.is_connected():
+                        status['login_state'] = 'failed'
+                        status['login_error'] = '连接 Telegram 失败'
+                        self.log_signal.emit(f"🔴 账号 {name} 登录检测失败: 连接 Telegram 失败")
+                    elif await client.is_user_authorized():
+                        status['login_state'] = 'logged_in'
+                        self.log_signal.emit(f"🟢 账号 {name} 已登录")
+                    else:
+                        status['login_state'] = 'not_logged_in'
+                        self.log_signal.emit(f"⚪ 账号 {name} 未登录")
+                except Exception as e:
+                    status['login_state'] = 'failed'
+                    status['login_error'] = translate_error_message(str(e))
+                    self.log_signal.emit(f"🔴 账号 {name} 登录状态异常: {status['login_error']}")
+                finally:
+                    try:
+                        await client.disconnect()
+                    except:
+                        pass
+
             except Exception as e:
+                # 捕获整个账号检测过程的异常，防止程序崩溃
                 status['login_state'] = 'failed'
-                status['login_error'] = translate_error_message(str(e))
-                self.log_signal.emit(f"🔴 账号 {name} 登录状态异常: {status['login_error']}")
-            finally:
-                await client.disconnect()
+                status['login_error'] = f"检测异常: {translate_error_message(str(e))}"
+                self.log_signal.emit(f"❌ 账号 {name} 检测异常: {status['login_error']}")
 
             self.status_signal.emit({name: status})
 
