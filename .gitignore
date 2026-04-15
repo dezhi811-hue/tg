@@ -38,7 +38,7 @@ wheels/
 
 # PyInstaller
 *.manifest
-*.spec
+*.spec.bak
 
 # macOS
 .DS_Store
