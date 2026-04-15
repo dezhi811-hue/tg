@@ -46,19 +46,3 @@ jobs:
       with:
         name: TelegramFilter-Windows
         path: telegram_filter/dist/TelegramFilter-Windows.zip
-
-    - name: Get current date
-      id: date
-      run: echo "date=$(date +'%Y%m%d-%H%M')" >> $GITHUB_OUTPUT
-      shell: bash
-
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: v${{ steps.date.outputs.date }}
-        name: Windows Build ${{ steps.date.outputs.date }}
-        files: telegram_filter/dist/TelegramFilter-Windows.zip
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
