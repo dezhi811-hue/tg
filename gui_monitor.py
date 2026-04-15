@@ -323,6 +323,7 @@ class FilterThread(QThread):
     status_signal = pyqtSignal(dict)  # 账号状态更新
     finished_signal = pyqtSignal()
     probe_signal = pyqtSignal(str, str, int, int)  # (phone, status, current_idx, total)
+    probe_anomaly_signal = pyqtSignal(str, int, int)  # (probe_phone, current_idx, total)
     conflict_signal = pyqtSignal(dict)
     emergency_pause_signal = pyqtSignal(dict)
 
@@ -838,6 +839,22 @@ class FilterThread(QThread):
                                 self.log_signal.emit(f"  [探针{probe_idx}] ❓ {probe_display} 未确认 | {probe_message}")
                                 if environment_unstable:
                                     self.log_signal.emit(f"  [探针{probe_idx}] ⚠️ 当前查询环境已标记为不稳定")
+
+                                # 发射探针异常信号，停止筛选
+                                self.probe_anomaly_signal.emit(probe_phone, i + 1, len(self.phones))
+                                self.running = False
+                                self.save_progress(
+                                    i,
+                                    registered_count,
+                                    unregistered_count,
+                                    registered_batch,
+                                    registered_file_index,
+                                    uncertain_count,
+                                    environment_unstable,
+                                    probe_failure_count
+                                )
+                                await manager.disconnect_all()
+                                return
                         except Exception as e:
                             probe_failure_count += 1
                             environment_unstable = probe_failure_count >= self.PROBE_FAILURE_THRESHOLD
