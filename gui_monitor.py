@@ -102,7 +102,7 @@ class LoginThread(QThread):
         proxy_config = None
         if proxy and proxy.get('host'):
             proxy_config = ('socks5', proxy['host'], proxy['port'],
-                          True, proxy.get('username', ''), proxy.get('password', ''))
+                          proxy.get('username') or None, proxy.get('password') or None)
 
         client = TelegramClient(
             f"session_{self.account['name']}",
@@ -191,7 +191,7 @@ class AccountCheckThread(QThread):
             proxy_config = None
             if proxy and proxy.get('host'):
                 proxy_config = ('socks5', proxy['host'], proxy['port'],
-                              True, proxy.get('username', ''), proxy.get('password', ''))
+                              proxy.get('username') or None, proxy.get('password') or None)
                 proxy_client = None
                 try:
                     proxy_client = TelegramClient(
@@ -221,7 +221,8 @@ class AccountCheckThread(QThread):
             client = TelegramClient(
                 f"session_{name}",
                 int(account['api_id']),
-                account['api_hash']
+                account['api_hash'],
+                proxy=proxy_config
             )
             try:
                 await client.connect()
