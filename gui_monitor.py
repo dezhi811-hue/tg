@@ -589,128 +589,138 @@ class FilterThread(QThread):
             limiter = RateLimiter(self.config['rate_limit'])
             filter_obj = TelegramFilter(manager, limiter)
 
-        results = []
-        progress = self.load_progress()
-        start_index = 0
-        registered_count = 0
-        unregistered_count = 0
-        uncertain_count = 0
-        registered_batch = []
-        registered_file_index = 1
-        environment_unstable = False
-        probe_failure_count = 0
+            results = []
+            progress = self.load_progress()
+            start_index = 0
+            registered_count = 0
+            unregistered_count = 0
+            uncertain_count = 0
+            registered_batch = []
+            registered_file_index = 1
+            environment_unstable = False
+            probe_failure_count = 0
 
-        if progress:
-            start_index = progress.get('next_index', 0)
-            registered_count = progress.get('registered_count', 0)
-            unregistered_count = progress.get('unregistered_count', 0)
-            uncertain_count = progress.get('uncertain_count', 0)
-            registered_batch = progress.get('registered_batch', [])
-            registered_file_index = progress.get('registered_file_index', 1)
-            environment_unstable = progress.get('environment_unstable', False)
-            probe_failure_count = progress.get('probe_failure_count', 0)
-            if start_index > 0:
-                self.log_signal.emit(f"📂 检测到上次进度，从第 {start_index + 1} 条继续")
+            if progress:
+                start_index = progress.get('next_index', 0)
+                registered_count = progress.get('registered_count', 0)
+                unregistered_count = progress.get('unregistered_count', 0)
+                uncertain_count = progress.get('uncertain_count', 0)
+                registered_batch = progress.get('registered_batch', [])
+                registered_file_index = progress.get('registered_file_index', 1)
+                environment_unstable = progress.get('environment_unstable', False)
+                probe_failure_count = progress.get('probe_failure_count', 0)
+                if start_index > 0:
+                    self.log_signal.emit(f"📂 检测到上次进度，从第 {start_index + 1} 条继续")
 
-        for i in range(start_index, len(self.phones)):
-            phone = self.phones[i]
-            if not self.running:
-                break
+            for i in range(start_index, len(self.phones)):
+                phone = self.phones[i]
+                if not self.running:
+                    break
 
-            self.log_signal.emit(f"[{i+1}/{len(self.phones)}] 检查 {phone}")
+                self.log_signal.emit(f"[{i+1}/{len(self.phones)}] 检查 {phone}")
 
-            for attempt in range(1, self.MAX_RETRIES + 1):
-                try:
-                    result = await self.resolve_phone_result(filter_obj, phone, self.country)
-                    results.append(result)
+                for attempt in range(1, self.MAX_RETRIES + 1):
+                    try:
+                        result = await self.resolve_phone_result(filter_obj, phone, self.country)
+                        results.append(result)
 
-                    status = self.get_account_status(manager)
-                    self.status_signal.emit(status)
+                        status = self.get_account_status(manager)
+                        self.status_signal.emit(status)
 
-                    display_phone = self.get_display_phone(result, phone)
+                        display_phone = self.get_display_phone(result, phone)
 
-                    if result['registered']:
-                        registered_count += 1
-                        registered_batch.append(self.build_registered_entry(result))
-                        if len(registered_batch) >= self.REGISTERED_CHUNK_SIZE:
-                            self.save_registered_chunk(registered_batch, registered_file_index)
-                            registered_batch = []
-                            registered_file_index += 1
+                        if result['registered']:
+                            registered_count += 1
+                            registered_batch.append(self.build_registered_entry(result))
+                            if len(registered_batch) >= self.REGISTERED_CHUNK_SIZE:
+                                self.save_registered_chunk(registered_batch, registered_file_index)
+                                registered_batch = []
+                                registered_file_index += 1
 
-                        status_text = result.get('status') or 'unknown'
-                        last_seen = result.get('last_seen')
-                        retry_suffix = ''
-                        if result.get('recovered_after_retry'):
-                            retry_suffix = f" | 复查后成功({result.get('retry_attempts')})"
-                        if last_seen:
-                            self.log_signal.emit(f"  ✅ 已注册 | {display_phone} | {status_text} | {last_seen}{retry_suffix}")
+                            status_text = result.get('status') or 'unknown'
+                            last_seen = result.get('last_seen')
+                            retry_suffix = ''
+                            if result.get('recovered_after_retry'):
+                                retry_suffix = f" | 复查后成功({result.get('retry_attempts')})"
+                            if last_seen:
+                                self.log_signal.emit(f"  ✅ 已注册 | {display_phone} | {status_text} | {last_seen}{retry_suffix}")
+                            else:
+                                self.log_signal.emit(f"  ✅ 已注册 | {display_phone} | {status_text}{retry_suffix}")
                         else:
-                            self.log_signal.emit(f"  ✅ 已注册 | {display_phone} | {status_text}{retry_suffix}")
-                    else:
-                        active_primary = manager.get_active_primary_accounts()
-                        conflict_handled = False
-                        if len(active_primary) >= 2:
-                            first_primary = active_primary[0]
-                            second_primary = active_primary[1]
-                            second_result = await self.query_with_account(filter_obj, second_primary, phone, self.country)
-                            if second_result.get('registered'):
-                                conflict_handled = True
-                                registered_count += 1
-                                registered_batch.append(self.build_registered_entry(second_result))
-                                if len(registered_batch) >= self.REGISTERED_CHUNK_SIZE:
-                                    self.save_registered_chunk(registered_batch, registered_file_index)
-                                    registered_batch = []
-                                    registered_file_index += 1
-
-                                second_display_phone = self.get_display_phone(second_result, phone)
-                                second_status = second_result.get('status') or 'unknown'
-                                second_last_seen = second_result.get('last_seen')
-                                if second_last_seen:
-                                    self.log_signal.emit(f"  ✅ 复核命中 | {second_primary['name']} | {second_display_phone} | {second_status} | {second_last_seen}")
-                                else:
-                                    self.log_signal.emit(f"  ✅ 复核命中 | {second_primary['name']} | {second_display_phone} | {second_status}")
-
-                                await self.handle_account_conflict(
-                                    manager,
-                                    filter_obj,
-                                    first_primary,
-                                    second_primary,
-                                    phone,
-                                    second_result,
-                                    i + 1,
-                                    len(self.phones)
-                                )
-                            elif len(active_primary) >= 3:
-                                third_primary = active_primary[2]
-                                third_result = await self.query_with_account(filter_obj, third_primary, phone, self.country)
-                                if third_result.get('registered'):
+                            active_primary = manager.get_active_primary_accounts()
+                            conflict_handled = False
+                            if len(active_primary) >= 2:
+                                first_primary = active_primary[0]
+                                second_primary = active_primary[1]
+                                second_result = await self.query_with_account(filter_obj, second_primary, phone, self.country)
+                                if second_result.get('registered'):
                                     conflict_handled = True
-                                    manager.mark_account_suspected(second_primary, f"miss_before:{third_primary['name']}")
                                     registered_count += 1
-                                    registered_batch.append(self.build_registered_entry(third_result))
+                                    registered_batch.append(self.build_registered_entry(second_result))
                                     if len(registered_batch) >= self.REGISTERED_CHUNK_SIZE:
                                         self.save_registered_chunk(registered_batch, registered_file_index)
                                         registered_batch = []
                                         registered_file_index += 1
 
-                                    third_display_phone = self.get_display_phone(third_result, phone)
-                                    third_status = third_result.get('status') or 'unknown'
-                                    third_last_seen = third_result.get('last_seen')
-                                    if third_last_seen:
-                                        self.log_signal.emit(f"  ✅ 三级复核命中 | {first_primary['name']} 未命中 -> {second_primary['name']} 未命中 -> {third_primary['name']} 命中 | {third_display_phone} | {third_status} | {third_last_seen}")
+                                    second_display_phone = self.get_display_phone(second_result, phone)
+                                    second_status = second_result.get('status') or 'unknown'
+                                    second_last_seen = second_result.get('last_seen')
+                                    if second_last_seen:
+                                        self.log_signal.emit(f"  ✅ 复核命中 | {second_primary['name']} | {second_display_phone} | {second_status} | {second_last_seen}")
                                     else:
-                                        self.log_signal.emit(f"  ✅ 三级复核命中 | {first_primary['name']} 未命中 -> {second_primary['name']} 未命中 -> {third_primary['name']} 命中 | {third_display_phone} | {third_status}")
+                                        self.log_signal.emit(f"  ✅ 复核命中 | {second_primary['name']} | {second_display_phone} | {second_status}")
 
                                     await self.handle_account_conflict(
                                         manager,
                                         filter_obj,
                                         first_primary,
-                                        third_primary,
+                                        second_primary,
                                         phone,
-                                        third_result,
+                                        second_result,
                                         i + 1,
                                         len(self.phones)
                                     )
+                                elif len(active_primary) >= 3:
+                                    third_primary = active_primary[2]
+                                    third_result = await self.query_with_account(filter_obj, third_primary, phone, self.country)
+                                    if third_result.get('registered'):
+                                        conflict_handled = True
+                                        manager.mark_account_suspected(second_primary, f"miss_before:{third_primary['name']}")
+                                        registered_count += 1
+                                        registered_batch.append(self.build_registered_entry(third_result))
+                                        if len(registered_batch) >= self.REGISTERED_CHUNK_SIZE:
+                                            self.save_registered_chunk(registered_batch, registered_file_index)
+                                            registered_batch = []
+                                            registered_file_index += 1
+
+                                        third_display_phone = self.get_display_phone(third_result, phone)
+                                        third_status = third_result.get('status') or 'unknown'
+                                        third_last_seen = third_result.get('last_seen')
+                                        if third_last_seen:
+                                            self.log_signal.emit(f"  ✅ 三级复核命中 | {first_primary['name']} 未命中 -> {second_primary['name']} 未命中 -> {third_primary['name']} 命中 | {third_display_phone} | {third_status} | {third_last_seen}")
+                                        else:
+                                            self.log_signal.emit(f"  ✅ 三级复核命中 | {first_primary['name']} 未命中 -> {second_primary['name']} 未命中 -> {third_primary['name']} 命中 | {third_display_phone} | {third_status}")
+
+                                        await self.handle_account_conflict(
+                                            manager,
+                                            filter_obj,
+                                            first_primary,
+                                            third_primary,
+                                            phone,
+                                            third_result,
+                                            i + 1,
+                                            len(self.phones)
+                                        )
+                                    else:
+                                        classification, message = self.describe_non_registered_result(result, environment_unstable)
+                                        if classification == 'unregistered':
+                                            unregistered_count += 1
+                                            self.log_signal.emit(f"  ❌ 未注册 | {display_phone} | {message}")
+                                        elif classification == 'invalid':
+                                            self.log_signal.emit(f"  ⚠️ 号码无效 | {display_phone}")
+                                        else:
+                                            uncertain_count += 1
+                                            self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
                                 else:
                                     classification, message = self.describe_non_registered_result(result, environment_unstable)
                                     if classification == 'unregistered':
@@ -721,95 +731,85 @@ class FilterThread(QThread):
                                     else:
                                         uncertain_count += 1
                                         self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
-                            else:
+                            if not active_primary or (len(active_primary) < 2 and not conflict_handled):
                                 classification, message = self.describe_non_registered_result(result, environment_unstable)
                                 if classification == 'unregistered':
                                     unregistered_count += 1
                                     self.log_signal.emit(f"  ❌ 未注册 | {display_phone} | {message}")
                                 elif classification == 'invalid':
                                     self.log_signal.emit(f"  ⚠️ 号码无效 | {display_phone}")
-                                else:
+                                elif not conflict_handled:
                                     uncertain_count += 1
                                     self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
-                        if not active_primary or (len(active_primary) < 2 and not conflict_handled):
-                            classification, message = self.describe_non_registered_result(result, environment_unstable)
-                            if classification == 'unregistered':
-                                unregistered_count += 1
-                                self.log_signal.emit(f"  ❌ 未注册 | {display_phone} | {message}")
-                            elif classification == 'invalid':
-                                self.log_signal.emit(f"  ⚠️ 号码无效 | {display_phone}")
-                            elif not conflict_handled:
-                                uncertain_count += 1
-                                self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
 
-                    self.save_progress(
-                        i + 1,
-                        registered_count,
-                        unregistered_count,
-                        registered_batch,
-                        registered_file_index,
-                        uncertain_count,
-                        environment_unstable,
-                        probe_failure_count
-                    )
-                    break
-                except Exception as e:
-                    error_text = str(e)
-                    if attempt < self.MAX_RETRIES and any(key in error_text.lower() for key in ['reset by peer', 'server closed', 'timed out', 'connection', 'timeout']):
-                        self.log_signal.emit(f"  ⚠️ 网络异常，第 {attempt} 次重试")
-                        await self.reconnect_manager(manager)
-                        continue
-                    self.log_signal.emit(f"  ⚠️ 错误: {error_text}")
-                    self.save_progress(
-                        i,
-                        registered_count,
-                        unregistered_count,
-                        registered_batch,
-                        registered_file_index,
-                        uncertain_count,
-                        environment_unstable,
-                        probe_failure_count
-                    )
-                    await manager.disconnect_all()
-                    return
+                        self.save_progress(
+                            i + 1,
+                            registered_count,
+                            unregistered_count,
+                            registered_batch,
+                            registered_file_index,
+                            uncertain_count,
+                            environment_unstable,
+                            probe_failure_count
+                        )
+                        break
+                    except Exception as e:
+                        error_text = str(e)
+                        if attempt < self.MAX_RETRIES and any(key in error_text.lower() for key in ['reset by peer', 'server closed', 'timed out', 'connection', 'timeout']):
+                            self.log_signal.emit(f"  ⚠️ 网络异常，第 {attempt} 次重试")
+                            await self.reconnect_manager(manager)
+                            continue
+                        self.log_signal.emit(f"  ⚠️ 错误: {error_text}")
+                        self.save_progress(
+                            i,
+                            registered_count,
+                            unregistered_count,
+                            registered_batch,
+                            registered_file_index,
+                            uncertain_count,
+                            environment_unstable,
+                            probe_failure_count
+                        )
+                        await manager.disconnect_all()
+                        return
 
-            # ── 探针验证：每隔 N 个号静默检查一次 ──
-            if self.running and self.probe_interval > 0 and self.probe_phones:
-                probe_idx = (i + 1) // self.probe_interval
-                if (i + 1) % self.probe_interval == 0 and probe_idx > 0:
-                    probe_phone = self.probe_phones[(probe_idx - 1) % len(self.probe_phones)]
-                    self.log_signal.emit(f"[探针{probe_idx}] 验证 {probe_phone}...")
-                    try:
-                        probe_result = await self.resolve_phone_result(filter_obj, probe_phone, self.country)
-                        probe_original = probe_result.get('original_phone') or probe_phone
-                        probe_formatted = probe_result.get('phone') or probe_phone
-                        probe_display = probe_formatted if probe_formatted == probe_original else f"{probe_original} -> {probe_formatted}"
-                        if probe_result['registered']:
-                            probe_failure_count = 0
-                            if environment_unstable:
-                                self.log_signal.emit(f"  [探针{probe_idx}] ✅ {probe_display} 已恢复正常")
+                # ── 探针验证：每隔 N 个号静默检查一次 ──
+                if self.running and self.probe_interval > 0 and self.probe_phones:
+                    probe_idx = (i + 1) // self.probe_interval
+                    if (i + 1) % self.probe_interval == 0 and probe_idx > 0:
+                        probe_phone = self.probe_phones[(probe_idx - 1) % len(self.probe_phones)]
+                        self.log_signal.emit(f"[探针{probe_idx}] 验证 {probe_phone}...")
+                        try:
+                            probe_result = await self.resolve_phone_result(filter_obj, probe_phone, self.country)
+                            probe_original = probe_result.get('original_phone') or probe_phone
+                            probe_formatted = probe_result.get('phone') or probe_phone
+                            probe_display = probe_formatted if probe_formatted == probe_original else f"{probe_original} -> {probe_formatted}"
+                            if probe_result['registered']:
+                                probe_failure_count = 0
+                                if environment_unstable:
+                                    self.log_signal.emit(f"  [探针{probe_idx}] ✅ {probe_display} 已恢复正常")
+                                else:
+                                    self.log_signal.emit(f"  [探针{probe_idx}] ✅ {probe_display} 已注册（正常）")
+                                environment_unstable = False
                             else:
-                                self.log_signal.emit(f"  [探针{probe_idx}] ✅ {probe_display} 已注册（正常）")
-                            environment_unstable = False
-                        else:
+                                probe_failure_count += 1
+                                environment_unstable = probe_failure_count >= self.PROBE_FAILURE_THRESHOLD
+                                _, probe_message = self.describe_non_registered_result(probe_result, environment_unstable)
+                                self.log_signal.emit(f"  [探针{probe_idx}] ❓ {probe_display} 未确认 | {probe_message}")
+                                if environment_unstable:
+                                    self.log_signal.emit(f"  [探针{probe_idx}] ⚠️ 当前查询环境已标记为不稳定")
+                        except Exception as e:
                             probe_failure_count += 1
                             environment_unstable = probe_failure_count >= self.PROBE_FAILURE_THRESHOLD
-                            _, probe_message = self.describe_non_registered_result(probe_result, environment_unstable)
-                            self.log_signal.emit(f"  [探针{probe_idx}] ❓ {probe_display} 未确认 | {probe_message}")
-                            if environment_unstable:
-                                self.log_signal.emit(f"  [探针{probe_idx}] ⚠️ 当前查询环境已标记为不稳定")
-                    except Exception as e:
-                        probe_failure_count += 1
-                        environment_unstable = probe_failure_count >= self.PROBE_FAILURE_THRESHOLD
-                        self.log_signal.emit(f"  [探针{probe_idx}] ⚠️ {probe_phone} 网络异常: {e}")
+                            self.log_signal.emit(f"  [探针{probe_idx}] ⚠️ {probe_phone} 网络异常: {e}")
 
-        if registered_batch:
-            self.save_registered_chunk(registered_batch, registered_file_index)
+            if registered_batch:
+                self.save_registered_chunk(registered_batch, registered_file_index)
 
-        self.clear_progress()
-        self.log_signal.emit(
-            f"✅ 筛选完成！共 {len(self.phones)} 个号码，已注册 {registered_count} 个，未确认 {uncertain_count} 个，未注册 {unregistered_count} 个"
-        )
+            self.clear_progress()
+            self.log_signal.emit(
+                f"✅ 筛选完成！共 {len(self.phones)} 个号码，已注册 {registered_count} 个，未确认 {uncertain_count} 个，未注册 {unregistered_count} 个"
+            )
 
         except Exception as e:
             import traceback
