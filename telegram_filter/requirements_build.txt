@@ -1,0 +1,5 @@
+pyinstaller>=5.0
+telethon>=1.24.0
+PyQt5>=5.15.0
+PySocks>=1.7.1
+cryptg

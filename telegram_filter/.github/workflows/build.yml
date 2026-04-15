@@ -1,0 +1,149 @@
+name: Build Releases
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements_build.txt
+
+      - name: Build Windows executable
+        run: |
+          pyinstaller build_config.spec
+
+      - name: Create release package
+        run: |
+          mkdir release
+          copy dist\TelegramFilter.exe release\
+          copy config.example.json release\
+          copy 使用说明.txt release\
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TelegramFilter-Windows
+          path: release/
+
+  build-macos-intel:
+    runs-on: macos-12  # Intel Mac
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip3 install -r requirements_build.txt
+
+      - name: Build macOS Intel executable
+        run: |
+          pyinstaller build_config.spec
+
+      - name: Create release package
+        run: |
+          mkdir release
+          cp -r dist/TelegramFilter.app release/
+          cp config.example.json release/
+          cp 使用说明.txt release/
+
+      - name: Upload macOS Intel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TelegramFilter-macOS-Intel
+          path: release/
+
+  build-macos:
+    runs-on: macos-latest  # Apple Silicon Mac
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip3 install -r requirements_build.txt
+
+      - name: Build macOS Apple Silicon executable
+        run: |
+          pyinstaller build_config.spec
+
+      - name: Create release package
+        run: |
+          mkdir release
+          cp -r dist/TelegramFilter.app release/
+          cp config.example.json release/
+          cp 使用说明.txt release/
+
+      - name: Upload macOS Apple Silicon artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TelegramFilter-macOS-AppleSilicon
+          path: release/
+
+  create-release:
+    needs: [build-windows, build-macos-intel, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: TelegramFilter-Windows
+          path: windows-release
+
+      - name: Download macOS Intel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: TelegramFilter-macOS-Intel
+          path: macos-intel-release
+
+      - name: Download macOS Apple Silicon artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: TelegramFilter-macOS-AppleSilicon
+          path: macos-arm-release
+
+      - name: Create zip files
+        run: |
+          cd windows-release && zip -r ../TelegramFilter-Windows.zip . && cd ..
+          cd macos-intel-release && zip -r ../TelegramFilter-macOS-Intel.zip . && cd ..
+          cd macos-arm-release && zip -r ../TelegramFilter-macOS-AppleSilicon.zip . && cd ..
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            TelegramFilter-Windows.zip
+            TelegramFilter-macOS-Intel.zip
+            TelegramFilter-macOS-AppleSilicon.zip
+          body: |
+            ## 下载说明
+
+            - **Windows 用户**: 下载 `TelegramFilter-Windows.zip`
+            - **macOS Intel 芯片用户**: 下载 `TelegramFilter-macOS-Intel.zip`
+            - **macOS Apple Silicon (M1/M2/M3) 用户**: 下载 `TelegramFilter-macOS-AppleSilicon.zip`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
