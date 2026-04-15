@@ -25,9 +25,10 @@ from telethon.errors import PhoneNumberInvalidError
 
 # 导入远程日志
 try:
-    from remote_logger import init_remote_logger, get_remote_logger
+    from remote_logger import init_remote_logger as init_remote_logger_func, get_remote_logger
     remote_logger = None  # 稍后从配置初始化
 except ImportError:
+    init_remote_logger_func = None
     remote_logger = None
 
 # 导入本地日志
@@ -973,9 +974,7 @@ class TelegramFilterGUI(QMainWindow):
 
             if bot_token and chat_id and enabled:
                 try:
-                    # 导入的函数名
-                    from remote_logger import init_remote_logger as init_logger_func
-                    remote_logger = init_logger_func(bot_token, chat_id, enabled)
+                    remote_logger = init_remote_logger_func(bot_token, chat_id, enabled)
                     remote_logger.info("筛号工具已启动")
                     if local_logger:
                         local_logger.info("远程日志初始化成功，已发送启动消息")
