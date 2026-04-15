@@ -1,0 +1,38 @@
+Windows 打包步骤
+================
+
+已修复的问题：
+1. 登录检测时添加了代理配置支持
+2. 修正了代理格式错误（移除多余的 True 参数）
+
+修改的文件：
+- gui_monitor.py (第 104-105 行, 第 193-194 行, 第 221-225 行)
+
+打包步骤：
+---------
+
+1. 在 Windows 机器上打开命令行，进入项目目录：
+   cd telegram_filter
+
+2. 运行打包脚本：
+   build_release.bat
+
+3. 打包完成后会生成：
+   dist\TelegramFilter-Windows.zip
+
+4. 将 zip 文件上传到仓库的 releases 或 dist 目录
+
+注意事项：
+---------
+- 确保 Windows 机器上已安装 Python 3.7+
+- 确保已安装打包依赖：pip install -r requirements_build.txt
+- 打包过程可能需要几分钟
+- 如果打包失败，检查是否缺少依赖模块
+
+测试验证：
+---------
+打包完成后，在 Windows 上测试：
+1. 解压 TelegramFilter-Windows.zip
+2. 将 config.json 放到同目录
+3. 运行 TelegramFilter.exe
+4. 检查是否能正常连接 Telegram 服务器
