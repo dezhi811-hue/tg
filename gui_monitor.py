@@ -35,10 +35,14 @@ def translate_error_message(message):
     mappings = [
         ("The phone number is invalid", "手机号无效，请检查国家区号和号码位数"),
         ("Connection to Telegram failed 5 time(s)", "连接 Telegram 失败，请检查网络或代理设置"),
+        ("Connection to Telegram failed", "连接 Telegram 失败，请检查网络或代理设置"),
         ("No module named 'socks'", "缺少代理模块 pysocks，请先安装"),
         ("All offered SOCKS5 authentication methods were rejected", "代理认证失败，请检查代理账号或密码"),
         ("timed out", "连接超时，请检查网络或代理"),
-        ("SendCodeRequest", "发送验证码失败")
+        ("TimeoutError", "连接超时，请检查网络或代理"),
+        ("SendCodeRequest", "发送验证码失败"),
+        ("OSError", "网络连接错误，请检查防火墙或网络设置"),
+        ("Cannot find any entity", "无法找到该用户"),
     ]
 
     for src, dst in mappings:
