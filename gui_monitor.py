@@ -18,6 +18,13 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
 from PyQt5.QtGui import QFont, QColor
 from telethon.errors import PhoneNumberInvalidError
 
+# 导入远程日志
+try:
+    from remote_logger import get_remote_logger
+    remote_logger = get_remote_logger()
+except ImportError:
+    remote_logger = None
+
 def get_config_path():
     """获取 config.json 路径，支持 EXE 打包和相对路径"""
     # EXE 打包时：资源文件在 sys._MEIPASS 目录
@@ -59,8 +66,28 @@ def load_config():
     return {"accounts": [], "rate_limit": {"requests_per_account": 30, "min_delay": 3, "max_delay": 8}}
 
 def save_config(config):
-    with open(config_path, 'w') as f:
-        json.dump(config, f, indent=2)
+    """保存配置文件，带备份机制"""
+    import shutil
+    backup_path = config_path + '.backup'
+
+    try:
+        # 先备份现有配置
+        if os.path.exists(config_path):
+            shutil.copy2(config_path, backup_path)
+
+        # 写入新配置
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+
+        # 验证写入是否成功
+        with open(config_path, 'r', encoding='utf-8') as f:
+            json.load(f)
+
+    except Exception as e:
+        # 如果保存失败，恢复备份
+        if os.path.exists(backup_path):
+            shutil.copy2(backup_path, config_path)
+        raise Exception(f"保存配置失败: {str(e)}")
 
 
 class LoginThread(QThread):
@@ -260,6 +287,14 @@ class AccountCheckThread(QThread):
                 status['login_error'] = f"检测异常: {translate_error_message(str(e))}"
                 self.log_signal.emit(f"❌ 账号 {name} 检测异常: {status['login_error']}")
 
+                # 发送到远程日志
+                if remote_logger:
+                    remote_logger.warning(
+                        f"账号 {name} 检测异常",
+                        exception=str(e),
+                        account_name=name
+                    )
+
             self.status_signal.emit({name: status})
 
 
@@ -297,8 +332,19 @@ class FilterThread(QThread):
         except Exception as e:
             import traceback
             error_msg = f"❌ 筛选任务异常: {translate_error_message(str(e))}"
+            error_trace = traceback.format_exc()
+
             self.log_signal.emit(error_msg)
-            self.log_signal.emit(f"详细错误: {traceback.format_exc()}")
+            self.log_signal.emit(f"详细错误: {error_trace}")
+
+            # 发送到远程日志
+            if remote_logger:
+                remote_logger.critical(
+                    "筛选任务崩溃",
+                    exception=e,
+                    error_message=str(e),
+                    traceback=error_trace
+                )
         finally:
             self.finished_signal.emit()
 
@@ -767,8 +813,19 @@ class FilterThread(QThread):
 
         except Exception as e:
             import traceback
+            error_trace = traceback.format_exc()
             self.log_signal.emit(f"❌ 筛选过程出错: {translate_error_message(str(e))}")
-            self.log_signal.emit(f"详细错误: {traceback.format_exc()}")
+            self.log_signal.emit(f"详细错误: {error_trace}")
+
+            # 发送到远程日志
+            if remote_logger:
+                remote_logger.error(
+                    "筛选过程异常",
+                    exception=str(e),
+                    traceback=error_trace,
+                    phone_count=len(self.phones),
+                    current_index=i if 'i' in locals() else 0
+                )
         finally:
             if manager:
                 try:
