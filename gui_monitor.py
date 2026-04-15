@@ -278,6 +278,31 @@ class AccountCheckThread(QThread):
                     elif await client.is_user_authorized():
                         status['login_state'] = 'logged_in'
                         self.log_signal.emit(f"🟢 账号 {name} 已登录")
+
+                        # 测试实际查询功能
+                        try:
+                            from telethon.tl.functions.contacts import ImportContactsRequest
+                            from telethon.tl.types import InputPhoneContact
+
+                            test_phone = "+42777"  # Telegram官方测试号
+                            contact = InputPhoneContact(
+                                client_id=0,
+                                phone=test_phone,
+                                first_name='Test',
+                                last_name=''
+                            )
+                            result = await client(ImportContactsRequest(contacts=[contact]))
+
+                            if result.users:
+                                status['api_test'] = 'success'
+                                self.log_signal.emit(f"  ✅ 账号 {name} API查询测试成功")
+                            else:
+                                status['api_test'] = 'empty_result'
+                                self.log_signal.emit(f"  ⚠️ 账号 {name} API查询返回空（可能网络问题）")
+                        except Exception as api_e:
+                            status['api_test'] = 'failed'
+                            status['api_error'] = translate_error_message(str(api_e))
+                            self.log_signal.emit(f"  ⚠️ 账号 {name} API查询测试失败: {status['api_error']}")
                     else:
                         status['login_state'] = 'not_logged_in'
                         self.log_signal.emit(f"⚪ 账号 {name} 未登录")
