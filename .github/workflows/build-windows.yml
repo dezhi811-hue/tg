@@ -36,8 +36,8 @@ jobs:
         cd dist
         mkdir TelegramFilter-Windows
         copy TelegramFilter.exe TelegramFilter-Windows\
-        copy ..\config_example.json TelegramFilter-Windows\ 2>$null || echo "config_example.json not found"
-        copy ..\使用说明.txt TelegramFilter-Windows\ 2>$null || echo "使用说明.txt not found"
+        if (Test-Path ..\config_example.json) { copy ..\config_example.json TelegramFilter-Windows\ }
+        if (Test-Path ..\使用说明.txt) { copy ..\使用说明.txt TelegramFilter-Windows\ }
         Compress-Archive -Path TelegramFilter-Windows -DestinationPath TelegramFilter-Windows.zip -Force
 
     - name: Upload artifact
