@@ -37,7 +37,7 @@ jobs:
         cd telegram_filter/dist
         mkdir TelegramFilter-Windows
         copy TelegramFilter.exe TelegramFilter-Windows\
-        copy ..\config_example.json TelegramFilter-Windows\ 2>$null || echo "config_example.json not found"
+        copy ..\config.example.json TelegramFilter-Windows\ 2>$null || echo "config.example.json not found"
         copy ..\使用说明.txt TelegramFilter-Windows\ 2>$null || echo "使用说明.txt not found"
         Compress-Archive -Path TelegramFilter-Windows -DestinationPath TelegramFilter-Windows.zip -Force
 
