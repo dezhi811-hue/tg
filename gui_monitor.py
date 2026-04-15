@@ -19,11 +19,21 @@ from PyQt5.QtGui import QFont, QColor
 from telethon.errors import PhoneNumberInvalidError
 
 # 导入远程日志
+init_remote_logger = None
+get_remote_logger = None
+remote_logger = None
+
 try:
-    from remote_logger import init_remote_logger, get_remote_logger
-    remote_logger = None  # 稍后从配置初始化
-except ImportError:
-    remote_logger = None
+    from remote_logger import init_remote_logger as _init_remote_logger
+    from remote_logger import get_remote_logger as _get_remote_logger
+    init_remote_logger = _init_remote_logger
+    get_remote_logger = _get_remote_logger
+except Exception as e:
+    # 导入失败时记录到文件
+    with open('import_error.log', 'a', encoding='utf-8') as f:
+        f.write(f"\n[{datetime.now()}] 远程日志模块导入失败: {e}\n")
+        import traceback
+        f.write(traceback.format_exc())
 
 def get_config_path():
     """获取 config.json 路径，支持 EXE 打包和相对路径"""
@@ -328,23 +338,53 @@ class FilterThread(QThread):
     def run(self):
         """在后台运行筛选任务"""
         try:
-            asyncio.run(self.filter_task())
+            # 写入启动日志
+            with open('filter_thread.log', 'a', encoding='utf-8') as f:
+                f.write(f"\n[{datetime.now()}] 筛选线程启动\n")
+
+            # Windows 打包后需要设置事件循环策略
+            if sys.platform == 'win32':
+                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+            # 创建新的事件循环
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            try:
+                loop.run_until_complete(self.filter_task())
+            finally:
+                loop.close()
+
         except Exception as e:
             import traceback
             error_msg = f"❌ 筛选任务异常: {translate_error_message(str(e))}"
             error_trace = traceback.format_exc()
 
+            # 写入文件日志
+            try:
+                with open('filter_error.log', 'a', encoding='utf-8') as f:
+                    f.write(f"\n{'='*60}\n")
+                    f.write(f"[{datetime.now()}] 筛选任务崩溃\n")
+                    f.write(f"{'='*60}\n")
+                    f.write(f"错误: {str(e)}\n")
+                    f.write(f"堆栈:\n{error_trace}\n")
+            except:
+                pass
+
             self.log_signal.emit(error_msg)
             self.log_signal.emit(f"详细错误: {error_trace}")
 
             # 发送到远程日志
-            if remote_logger:
-                remote_logger.critical(
-                    "筛选任务崩溃",
-                    exception=e,
-                    error_message=str(e),
-                    traceback=error_trace
-                )
+            try:
+                if remote_logger:
+                    remote_logger.critical(
+                        "筛选任务崩溃",
+                        exception=e,
+                        error_message=str(e),
+                        traceback=error_trace
+                    )
+            except:
+                pass
         finally:
             self.finished_signal.emit()
 
@@ -881,10 +921,18 @@ class TelegramFilterGUI(QMainWindow):
 
             if bot_token and chat_id and enabled:
                 try:
-                    remote_logger = init_remote_logger(bot_token, chat_id, enabled)
-                    remote_logger.info("筛号工具已启动")
-                except Exception:
-                    pass
+                    if init_remote_logger is not None:
+                        remote_logger = init_remote_logger(bot_token, chat_id, enabled)
+                        if remote_logger:
+                            remote_logger.info("筛号工具已启动")
+                    else:
+                        with open('remote_logger_error.log', 'a', encoding='utf-8') as f:
+                            f.write(f"\n[{datetime.now()}] init_remote_logger 函数未定义，远程日志模块可能导入失败\n")
+                except Exception as e:
+                    with open('remote_logger_error.log', 'a', encoding='utf-8') as f:
+                        f.write(f"\n[{datetime.now()}] 远程日志初始化异常: {e}\n")
+                        import traceback
+                        f.write(traceback.format_exc())
 
     def load_account_login_status(self):
         for acc in self.config.get('accounts', []):
@@ -1774,12 +1822,60 @@ class TelegramFilterGUI(QMainWindow):
         event.accept()
 
 
+def exception_hook(exctype, value, tb):
+    """全局异常处理 - 捕获所有未处理的异常并记录到文件"""
+    import traceback
+    error_msg = ''.join(traceback.format_exception(exctype, value, tb))
+
+    # 写入崩溃日志文件
+    crash_log_path = 'crash.log'
+    try:
+        with open(crash_log_path, 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"程序崩溃 - {datetime.now()}\n")
+            f.write(f"{'='*60}\n")
+            f.write(error_msg)
+            f.write(f"\n{'='*60}\n\n")
+    except:
+        pass
+
+    # 尝试发送到远程日志
+    try:
+        if remote_logger:
+            remote_logger.critical("程序崩溃", exception=value)
+    except:
+        pass
+
+    # 显示错误对话框（如果 GUI 可用）
+    try:
+        from PyQt5.QtWidgets import QMessageBox
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Critical)
+        msg.setWindowTitle("程序错误")
+        msg.setText(f"程序遇到错误:\n\n{str(value)}\n\n详细信息已保存到 {crash_log_path}")
+        msg.exec_()
+    except:
+        pass
+
+    # 调用默认的异常处理
+    sys.__excepthook__(exctype, value, tb)
+
+
 def main():
-    app = QApplication(sys.argv)
-    app.setApplicationName("TelegramFilter")
-    gui = TelegramFilterGUI()
-    gui.show()
-    sys.exit(app.exec_())
+    # 设置全局异常处理
+    sys.excepthook = exception_hook
+
+    try:
+        app = QApplication(sys.argv)
+        app.setApplicationName("TelegramFilter")
+        gui = TelegramFilterGUI()
+        gui.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        # 捕获主函数中的异常
+        exception_hook(type(e), e, e.__traceback__)
+        raise
+
 
 if __name__ == '__main__':
     main()

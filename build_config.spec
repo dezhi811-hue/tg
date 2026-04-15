@@ -58,13 +58,13 @@ if sys.platform == 'win32':
         a.datas,
         [],
         name='TelegramFilter',
-        debug=False,
+        debug=True,  # 开启调试模式
         bootloader_ignore_signals=False,
         strip=False,
         upx=True,
         upx_exclude=[],
         runtime_tmpdir=None,
-        console=False,
+        console=True,  # 开启控制台窗口，方便看错误
         disable_windowed_traceback=False,
         argv_emulation=False,
         target_arch=None,
