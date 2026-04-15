@@ -4,7 +4,7 @@ import sys
 block_cipher = None
 
 a = Analysis(
-    ['run_gui.py'],
+    ['run_gui.py', 'gui_monitor.py', 'account_manager.py', 'filter.py', 'rate_limiter.py', 'remote_logger.py'],
     pathex=[],
     binaries=[],
     datas=[],
