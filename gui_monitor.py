@@ -20,8 +20,8 @@ from telethon.errors import PhoneNumberInvalidError
 
 # 导入远程日志
 try:
-    from remote_logger import get_remote_logger
-    remote_logger = get_remote_logger()
+    from remote_logger import init_remote_logger, get_remote_logger
+    remote_logger = None  # 稍后从配置初始化
 except ImportError:
     remote_logger = None
 
@@ -851,6 +851,10 @@ class TelegramFilterGUI(QMainWindow):
         self.account_status = {}
         self.editing_account_name = None
         self.load_account_login_status()
+
+        # 初始化远程日志
+        self.init_remote_logger()
+
         self.init_ui()
 
         # 定时器：每秒更新账号状态
@@ -860,6 +864,22 @@ class TelegramFilterGUI(QMainWindow):
 
         # 启动时检查登录状态
         QTimer.singleShot(500, self.check_initial_login)
+
+    def init_remote_logger(self):
+        """初始化远程日志"""
+        global remote_logger
+        if remote_logger is None:
+            log_config = self.config.get('remote_log', {})
+            bot_token = log_config.get('bot_token')
+            chat_id = log_config.get('chat_id')
+            enabled = log_config.get('enabled', False)
+
+            if bot_token and chat_id and enabled:
+                try:
+                    remote_logger = init_remote_logger(bot_token, chat_id, enabled)
+                    remote_logger.info("筛号工具已启动")
+                except Exception:
+                    pass
 
     def load_account_login_status(self):
         for acc in self.config.get('accounts', []):
