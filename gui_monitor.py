@@ -6,6 +6,7 @@ import sys
 import json
 import os
 import asyncio
+import random
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -626,8 +627,6 @@ class FilterThread(QThread):
                                    progress_lock, registered_batch, registered_file_index,
                                    environment_unstable, probe_failure_count):
         """处理单个号码（并发调用）"""
-        import random
-
         # 添加随机延迟，避免多个账号同时发起请求
         random_delay = random.uniform(0.1, 0.5)
         await asyncio.sleep(random_delay)
@@ -760,7 +759,6 @@ class FilterThread(QThread):
                     self.log_signal.emit(f"📂 检测到上次进度，从第 {start_index + 1} 条继续")
 
             # 使用锁保护共享变量
-            import asyncio
             progress_lock = asyncio.Lock()
 
             # 并发处理号码
