@@ -6,12 +6,8 @@ import sys
 import json
 import os
 import asyncio
-import platform
+import random
 from datetime import datetime
-
-# Windows 平台需要设置事件循环策略，避免多线程崩溃
-if platform.system() == 'Windows':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QTextEdit, QTabWidget,
@@ -24,30 +20,57 @@ from PyQt5.QtGui import QFont, QColor
 from telethon.errors import PhoneNumberInvalidError
 
 # 导入远程日志
-try:
-    from remote_logger import init_remote_logger as init_remote_logger_func, get_remote_logger
-    remote_logger = None  # 稍后从配置初始化
-except ImportError:
-    init_remote_logger_func = None
-    remote_logger = None
+init_remote_logger = None
+get_remote_logger = None
+remote_logger = None
 
-# 导入本地日志
 try:
-    from local_logger import get_local_logger
-    local_logger = get_local_logger()
-    local_logger.info("导入模块成功")
+    from remote_logger import init_remote_logger as _init_remote_logger
+    from remote_logger import get_remote_logger as _get_remote_logger
+    init_remote_logger = _init_remote_logger
+    get_remote_logger = _get_remote_logger
 except Exception as e:
-    local_logger = None
-    print(f"本地日志初始化失败: {e}")
+    # 导入失败时记录到文件
+    with open('import_error.log', 'a', encoding='utf-8') as f:
+        f.write(f"\n[{datetime.now()}] 远程日志模块导入失败: {e}\n")
+        import traceback
+        f.write(traceback.format_exc())
+
+def get_app_dir():
+    """获取应用程序目录（EXE 打包时为 EXE 所在目录，否则为脚本目录）"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
 def get_config_path():
     """获取 config.json 路径，支持 EXE 打包和相对路径"""
-    # EXE 打包时：资源文件在 sys._MEIPASS 目录
     if getattr(sys, 'frozen', False):
         base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
     else:
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, 'config.json')
+
+def get_session_path(name):
+    """获取 session 文件绝对路径，确保跨工作目录一致"""
+    return os.path.join(get_app_dir(), f"session_{name}")
+
+
+class _PinnedAccountManager:
+    """把 get_next_account 固定到指定账号的代理，其余调用透传给真实 manager。
+
+    用于临时用特定账号发起一次查询，不会改变账号调度状态，也不会因为真实
+    AccountManager 新增方法而漏桩。"""
+
+    def __init__(self, real_manager, pinned_account):
+        self._real = real_manager
+        self._account = pinned_account
+
+    def get_next_account(self):
+        return self._account
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
 
 config_path = get_config_path()
 
@@ -131,13 +154,7 @@ class LoginThread(QThread):
 
     def run(self):
         try:
-            # 创建新的事件循环（线程安全）
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(self.login_task())
-            finally:
-                loop.close()
+            asyncio.run(self.login_task())
         except Exception as e:
             self.finished_signal.emit(False, str(e))
 
@@ -157,7 +174,7 @@ class LoginThread(QThread):
                           proxy.get('username') or None, proxy.get('password') or None)
 
         client = TelegramClient(
-            f"session_{self.account['name']}",
+            get_session_path(self.account['name']),
             int(self.account['api_id']),
             self.account['api_hash'],
             proxy=proxy_config
@@ -171,7 +188,7 @@ class LoginThread(QThread):
             except Exception:
                 if proxy_config:
                     fallback_client = TelegramClient(
-                        f"session_{self.account['name']}",
+                        get_session_path(self.account['name']),
                         int(self.account['api_id']),
                         self.account['api_hash']
                     )
@@ -225,113 +242,131 @@ class AccountCheckThread(QThread):
 
     def run(self):
         try:
-            # 创建新的事件循环（线程安全）
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(self.check_accounts())
-            finally:
-                loop.close()
+            asyncio.run(self.check_accounts())
         except Exception as e:
             self.log_signal.emit(f"❌ 账号检测失败: {translate_error_message(str(e))}")
 
     async def check_accounts(self):
+        accounts = self.accounts or []
+        if not accounts:
+            return
+        await asyncio.gather(
+            *[self._check_single_account(acc) for acc in accounts],
+            return_exceptions=True,
+        )
+
+    async def _check_single_account(self, account):
         from telethon import TelegramClient
 
-        for account in self.accounts:
-            name = account['name']
-            status = {
-                'login_state': 'not_logged_in',
-                'proxy_state': 'not_configured'
-            }
+        name = account['name']
+        status = {
+            'login_state': 'not_logged_in',
+            'proxy_state': 'not_configured'
+        }
 
-            try:
-                proxy = account.get('proxy', {})
-                proxy_config = None
-                if proxy and proxy.get('host'):
-                    proxy_config = ('socks5', proxy['host'], proxy['port'],
-                                  proxy.get('username') or None, proxy.get('password') or None)
-                    proxy_client = None
-                    try:
-                        proxy_client = TelegramClient(
-                            f"session_{name}_proxy_check",
-                            int(account['api_id']),
-                            account['api_hash'],
-                            proxy=proxy_config
-                        )
-                        await proxy_client.connect()
-                        if proxy_client.is_connected():
-                            status['proxy_state'] = 'proxy_ok'
-                            self.log_signal.emit(f"🟢 账号 {name} 代理连接成功")
-                        else:
-                            status['proxy_state'] = 'proxy_failed'
-                            status['proxy_error'] = '代理连接失败'
-                            self.log_signal.emit(f"🔴 账号 {name} 代理连接失败")
-                    except Exception as e:
-                        status['proxy_state'] = 'proxy_failed'
-                        status['proxy_error'] = translate_error_message(str(e))
-                        self.log_signal.emit(f"🔴 账号 {name} 代理失败: {status['proxy_error']}")
-                    finally:
-                        if proxy_client:
-                            try:
-                                await proxy_client.disconnect()
-                            except:
-                                pass
-                else:
-                    self.log_signal.emit(f"⚪ 账号 {name} 未配置代理")
-
-                client = TelegramClient(
-                    f"session_{name}",
-                    int(account['api_id']),
-                    account['api_hash'],
-                    proxy=proxy_config
-                )
+        try:
+            proxy = account.get('proxy', {})
+            proxy_config = None
+            if proxy and proxy.get('host'):
+                proxy_config = ('socks5', proxy['host'], proxy['port'],
+                              proxy.get('username') or None, proxy.get('password') or None)
+                proxy_client = None
                 try:
-                    await client.connect()
-                    if not client.is_connected():
-                        status['login_state'] = 'failed'
-                        status['login_error'] = '连接 Telegram 失败'
-                        self.log_signal.emit(f"🔴 账号 {name} 登录检测失败: 连接 Telegram 失败")
-                    elif await client.is_user_authorized():
-                        status['login_state'] = 'logged_in'
-                        self.log_signal.emit(f"🟢 账号 {name} 已登录")
+                    proxy_client = TelegramClient(
+                        get_session_path(f"{name}_proxy_check"),
+                        int(account['api_id']),
+                        account['api_hash'],
+                        proxy=proxy_config
+                    )
+                    await proxy_client.connect()
+                    if proxy_client.is_connected():
+                        status['proxy_state'] = 'proxy_ok'
+                        self.log_signal.emit(f"🟢 账号 {name} 代理连接成功")
                     else:
-                        status['login_state'] = 'not_logged_in'
-                        self.log_signal.emit(f"⚪ 账号 {name} 未登录")
+                        status['proxy_state'] = 'proxy_failed'
+                        status['proxy_error'] = '代理连接失败'
+                        self.log_signal.emit(f"🔴 账号 {name} 代理连接失败")
                 except Exception as e:
-                    status['login_state'] = 'failed'
-                    status['login_error'] = translate_error_message(str(e))
-                    self.log_signal.emit(f"🔴 账号 {name} 登录状态异常: {status['login_error']}")
+                    status['proxy_state'] = 'proxy_failed'
+                    status['proxy_error'] = translate_error_message(str(e))
+                    self.log_signal.emit(f"🔴 账号 {name} 代理失败: {status['proxy_error']}")
                 finally:
+                    if proxy_client:
+                        try:
+                            await proxy_client.disconnect()
+                        except:
+                            pass
+            else:
+                self.log_signal.emit(f"⚪ 账号 {name} 未配置代理")
+
+            client = TelegramClient(
+                get_session_path(name),
+                int(account['api_id']),
+                account['api_hash'],
+                proxy=proxy_config
+            )
+            try:
+                await client.connect()
+                if not client.is_connected():
+                    status['login_state'] = 'failed'
+                    status['login_error'] = '连接 Telegram 失败'
+                    self.log_signal.emit(f"🔴 账号 {name} 登录检测失败: 连接 Telegram 失败")
+                elif await client.is_user_authorized():
+                    status['login_state'] = 'logged_in'
+                    self.log_signal.emit(f"🟢 账号 {name} 已登录")
+
+                    # 测试实际查询功能
                     try:
-                        await client.disconnect()
-                    except:
-                        pass
+                        from telethon.tl.functions.contacts import ImportContactsRequest
+                        from telethon.tl.types import InputPhoneContact
 
-            except Exception as e:
-                # 捕获整个账号检测过程的异常，防止程序崩溃
-                status['login_state'] = 'failed'
-                status['login_error'] = f"检测异常: {translate_error_message(str(e))}"
-                self.log_signal.emit(f"❌ 账号 {name} 检测异常: {status['login_error']}")
-
-                # 发送到远程日志
-                if local_logger:
-                    local_logger.warning(f"账号 {name} 检测异常: {str(e)}")
-
-                if remote_logger:
-                    try:
-                        remote_logger.warning(
-                            f"账号 {name} 检测异常",
-                            exception=str(e),
-                            account_name=name
+                        test_phone = "+42777"  # Telegram官方测试号
+                        contact = InputPhoneContact(
+                            client_id=0,
+                            phone=test_phone,
+                            first_name='Test',
+                            last_name=''
                         )
-                        if local_logger:
-                            local_logger.info("远程日志发送成功")
-                    except Exception as log_err:
-                        if local_logger:
-                            local_logger.error("远程日志发送失败", log_err)
+                        result = await client(ImportContactsRequest(contacts=[contact]))
 
-            self.status_signal.emit({name: status})
+                        if result.users:
+                            status['api_test'] = 'success'
+                            self.log_signal.emit(f"  ✅ 账号 {name} API查询测试成功")
+                        else:
+                            status['api_test'] = 'empty_result'
+                            self.log_signal.emit(f"  ⚠️ 账号 {name} API查询返回空（可能网络问题）")
+                    except Exception as api_e:
+                        status['api_test'] = 'failed'
+                        status['api_error'] = translate_error_message(str(api_e))
+                        self.log_signal.emit(f"  ⚠️ 账号 {name} API查询测试失败: {status['api_error']}")
+                else:
+                    status['login_state'] = 'not_logged_in'
+                    self.log_signal.emit(f"⚪ 账号 {name} 未登录")
+            except Exception as e:
+                status['login_state'] = 'failed'
+                status['login_error'] = translate_error_message(str(e))
+                self.log_signal.emit(f"🔴 账号 {name} 登录状态异常: {status['login_error']}")
+            finally:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+
+        except Exception as e:
+            # 捕获整个账号检测过程的异常，防止程序崩溃
+            status['login_state'] = 'failed'
+            status['login_error'] = f"检测异常: {translate_error_message(str(e))}"
+            self.log_signal.emit(f"❌ 账号 {name} 检测异常: {status['login_error']}")
+
+            # 发送到远程日志
+            if remote_logger:
+                remote_logger.warning(
+                    f"账号 {name} 检测异常",
+                    exception=str(e),
+                    account_name=name
+                )
+
+        self.status_signal.emit({name: status})
 
 
 class FilterThread(QThread):
@@ -349,6 +384,7 @@ class FilterThread(QThread):
     status_signal = pyqtSignal(dict)  # 账号状态更新
     finished_signal = pyqtSignal()
     probe_signal = pyqtSignal(str, str, int, int)  # (phone, status, current_idx, total)
+    probe_anomaly_signal = pyqtSignal(str, int, int)  # (probe_phone, current_idx, total)
     conflict_signal = pyqtSignal(dict)
     emergency_pause_signal = pyqtSignal(dict)
 
@@ -364,44 +400,53 @@ class FilterThread(QThread):
     def run(self):
         """在后台运行筛选任务"""
         try:
-            if local_logger:
-                local_logger.info("FilterThread started")
+            # 写入启动日志
+            with open('filter_thread.log', 'a', encoding='utf-8') as f:
+                f.write(f"\n[{datetime.now()}] 筛选线程启动\n")
 
-            # 创建新的事件循环（线程安全）
+            # Windows 打包后需要设置事件循环策略
+            if sys.platform == 'win32':
+                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+            # 创建新的事件循环
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+
             try:
                 loop.run_until_complete(self.filter_task())
             finally:
                 loop.close()
 
-            if local_logger:
-                local_logger.info("FilterThread completed")
         except Exception as e:
             import traceback
             error_msg = f"❌ 筛选任务异常: {translate_error_message(str(e))}"
             error_trace = traceback.format_exc()
 
+            # 写入文件日志
+            try:
+                with open('filter_error.log', 'a', encoding='utf-8') as f:
+                    f.write(f"\n{'='*60}\n")
+                    f.write(f"[{datetime.now()}] 筛选任务崩溃\n")
+                    f.write(f"{'='*60}\n")
+                    f.write(f"错误: {str(e)}\n")
+                    f.write(f"堆栈:\n{error_trace}\n")
+            except:
+                pass
+
             self.log_signal.emit(error_msg)
             self.log_signal.emit(f"详细错误: {error_trace}")
 
             # 发送到远程日志
-            if local_logger:
-                local_logger.critical(f"筛选任务崩溃: {str(e)}")
-
-            if remote_logger:
-                try:
+            try:
+                if remote_logger:
                     remote_logger.critical(
                         "筛选任务崩溃",
                         exception=e,
                         error_message=str(e),
                         traceback=error_trace
                     )
-                    if local_logger:
-                        local_logger.info("远程日志发送成功")
-                except Exception as log_err:
-                    if local_logger:
-                        local_logger.error("远程日志发送失败", log_err)
+            except:
+                pass
         finally:
             self.finished_signal.emit()
 
@@ -411,9 +456,9 @@ class FilterThread(QThread):
         return formatted_phone if formatted_phone == original_phone else f"{original_phone} -> {formatted_phone}"
 
     async def query_with_account(self, filter_obj, account, phone, country):
+        """用指定账号发起一次查询（临时替换 filter 的 manager 为透明代理）。"""
         original_manager = filter_obj.manager
-        proxy_manager = type('SingleAccountManager', (), {'get_next_account': lambda self: account})()
-        filter_obj.manager = proxy_manager
+        filter_obj.manager = _PinnedAccountManager(original_manager, account)
         try:
             return await self.resolve_phone_result(filter_obj, phone, country)
         finally:
@@ -613,6 +658,81 @@ class FilterThread(QThread):
         final_result['error'] = '连续空返回，结果未确认'
         return final_result
 
+    async def process_single_phone(self, phone_idx, phone, worker, manager):
+        """处理单个号码（队列 worker 调用）"""
+        # 小随机延迟，避免多账号同时敲 TG
+        await asyncio.sleep(random.uniform(0.1, 0.5))
+
+        self.log_signal.emit(f"[{phone_idx+1}/{len(self.phones)}] 检查 {phone} (账号: {worker['account']['name']})")
+
+        try:
+            result = await self.resolve_phone_result(worker['filter'], phone, self.country)
+            display_phone = self.get_display_phone(result, phone)
+
+            if result['registered']:
+                status_text = result.get('status') or 'unknown'
+                last_seen = result.get('last_seen')
+                retry_suffix = ''
+                if result.get('recovered_after_retry'):
+                    retry_suffix = f" | 复查后成功({result.get('retry_attempts')})"
+                if last_seen:
+                    self.log_signal.emit(f"  ✅ 已注册 | {display_phone} | {status_text} | {last_seen}{retry_suffix}")
+                else:
+                    self.log_signal.emit(f"  ✅ 已注册 | {display_phone} | {status_text}{retry_suffix}")
+                return result
+
+            # 判断结果类型（不再使用全局 environment_unstable）
+            classification, message = self.describe_non_registered_result(result, False)
+
+            # 只在 uncertain 状态才复核
+            if classification == 'uncertain':
+                active_primary = manager.get_active_primary_accounts()
+                if len(active_primary) >= 2:
+                    for verify_account in active_primary:
+                        if verify_account['name'] == worker['account']['name']:
+                            continue
+                        verify_result = await self.query_with_account(worker['filter'], verify_account, phone, self.country)
+                        if verify_result.get('registered'):
+                            verify_display = self.get_display_phone(verify_result, phone)
+                            verify_status = verify_result.get('status') or 'unknown'
+                            verify_last_seen = verify_result.get('last_seen')
+                            if verify_last_seen:
+                                self.log_signal.emit(f"  ✅ 复核命中 | {verify_account['name']} | {verify_display} | {verify_status} | {verify_last_seen}")
+                            else:
+                                self.log_signal.emit(f"  ✅ 复核命中 | {verify_account['name']} | {verify_display} | {verify_status}")
+                            return verify_result
+
+            result['classification'] = classification
+            if classification == 'unregistered':
+                self.log_signal.emit(f"  ❌ 未注册 | {display_phone} | {message}")
+            elif classification == 'invalid':
+                self.log_signal.emit(f"  ⚠️ 号码无效 | {display_phone}")
+            else:
+                self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
+            return result
+
+        except Exception as e:
+            self.log_signal.emit(f"  ⚠️ 错误: {str(e)}")
+            return None
+
+    def _accumulate_result(self, state, result):
+        """将单次查询结果累加到共享状态（调用方持有 state_lock）。"""
+        if result is None:
+            return
+        if result.get('registered'):
+            state['registered_count'] += 1
+            state['registered_batch'].append(self.build_registered_entry(result))
+            if len(state['registered_batch']) >= self.REGISTERED_CHUNK_SIZE:
+                self.save_registered_chunk(state['registered_batch'], state['registered_file_index'])
+                state['registered_batch'] = []
+                state['registered_file_index'] += 1
+        else:
+            classification = result.get('classification', 'uncertain')
+            if classification == 'unregistered':
+                state['unregistered_count'] += 1
+            elif classification == 'uncertain':
+                state['uncertain_count'] += 1
+
     def describe_non_registered_result(self, result, environment_unstable):
         query_state = result.get('query_state')
         if query_state == 'invalid':
@@ -630,263 +750,233 @@ class FilterThread(QThread):
         return 'uncertain', result.get('error') or '结果未确认'
 
     async def filter_task(self):
-        """异步筛选任务"""
+        """异步筛选任务 - 队列 + 常驻 worker 模式
+
+        - 每个账号一个 worker 协程，从公共队列里取号处理，互不等待（消除木桶效应）
+        - 探针按账号独立计数；某账号连续失败只暂停该账号；全部账号都挂才紧急停止
+        """
         from account_manager import AccountManager
         from filter import TelegramFilter
         from rate_limiter import RateLimiter
-
-        if local_logger:
-            local_logger.info(f"filter_task started: {len(self.phones)} phones")
 
         manager = None
         try:
             self.log_signal.emit(f"🚀 开始筛选 {len(self.phones)} 个号码")
 
-            if local_logger:
-                local_logger.info("Initializing AccountManager")
-
-            # 初始化管理器
             manager = AccountManager(config_path)
-
-            if local_logger:
-                local_logger.info("Connecting all accounts")
-
             await manager.connect_all()
 
-            if local_logger:
-                local_logger.info("Creating RateLimiter and TelegramFilter")
+            active_primary = manager.get_active_primary_accounts()
+            if not active_primary:
+                self.log_signal.emit("❌ 没有可用的primary账号")
+                return
 
-            limiter = RateLimiter(self.config['rate_limit'])
-            filter_obj = TelegramFilter(manager, limiter)
+            self.log_signal.emit(f"🔥 启用 {len(active_primary)} 个账号并发查询（队列模式）")
 
-            if local_logger:
-                local_logger.info("Loading progress")
+            workers = []
+            for account in active_primary:
+                limiter = RateLimiter(self.config['rate_limit'])
+                filter_obj = TelegramFilter(manager, limiter)
+                workers.append({
+                    'account': account,
+                    'limiter': limiter,
+                    'filter': filter_obj,
+                    'paused': False,
+                    'probe_failures': 0,
+                })
 
-            results = []
+            # 恢复进度
             progress = self.load_progress()
             start_index = 0
-            registered_count = 0
-            unregistered_count = 0
-            uncertain_count = 0
-            registered_batch = []
-            registered_file_index = 1
-            environment_unstable = False
-            probe_failure_count = 0
-
+            state = {
+                'registered_count': 0,
+                'unregistered_count': 0,
+                'uncertain_count': 0,
+                'registered_batch': [],
+                'registered_file_index': 1,
+                'processed': 0,
+            }
             if progress:
                 start_index = progress.get('next_index', 0)
-                registered_count = progress.get('registered_count', 0)
-                unregistered_count = progress.get('unregistered_count', 0)
-                uncertain_count = progress.get('uncertain_count', 0)
-                registered_batch = progress.get('registered_batch', [])
-                registered_file_index = progress.get('registered_file_index', 1)
-                environment_unstable = progress.get('environment_unstable', False)
-                probe_failure_count = progress.get('probe_failure_count', 0)
+                state['registered_count'] = progress.get('registered_count', 0)
+                state['unregistered_count'] = progress.get('unregistered_count', 0)
+                state['uncertain_count'] = progress.get('uncertain_count', 0)
+                state['registered_batch'] = progress.get('registered_batch', [])
+                state['registered_file_index'] = progress.get('registered_file_index', 1)
+                state['processed'] = start_index
                 if start_index > 0:
                     self.log_signal.emit(f"📂 检测到上次进度，从第 {start_index + 1} 条继续")
 
-            for i in range(start_index, len(self.phones)):
-                phone = self.phones[i]
-                if not self.running:
-                    if local_logger:
-                        local_logger.info(f"Filter stopped by user at index {i}")
-                    break
+            # 号码队列
+            phone_queue = asyncio.Queue()
+            for idx in range(start_index, len(self.phones)):
+                phone_queue.put_nowait((idx, self.phones[idx]))
 
-                if local_logger and i % 10 == 0:
-                    local_logger.info(f"Processing phone {i+1}/{len(self.phones)}")
+            state_lock = asyncio.Lock()
+            # 乱序完成时，只推进"连续已完成"水位线，保证中断恢复不会跳过未完成号
+            completed_ahead = set()
 
-                self.log_signal.emit(f"[{i+1}/{len(self.phones)}] 检查 {phone}")
+            running_tasks = []
 
-                for attempt in range(1, self.MAX_RETRIES + 1):
+            def promote_backup(failed_account, reason):
+                """把一个备用号升级为工作号，并为它启动 worker。无可用备用返回 None。"""
+                backups = manager.get_available_backup_accounts()
+                backup = next((b for b in backups if b.get('client')), None)
+                if not backup:
+                    return None
+                try:
+                    manager.replace_primary_account(failed_account, backup, reason)
+                except Exception as e:
+                    self.log_signal.emit(f"  ⚠️ 升级备用号失败: {e}")
+                    return None
+                new_limiter = RateLimiter(self.config['rate_limit'])
+                new_filter = TelegramFilter(manager, new_limiter)
+                new_worker = {
+                    'account': backup,
+                    'limiter': new_limiter,
+                    'filter': new_filter,
+                    'paused': False,
+                    'probe_failures': 0,
+                }
+                workers.append(new_worker)
+                running_tasks.append(asyncio.create_task(worker_loop(new_worker)))
+                self.log_signal.emit(
+                    f"  🔁 备用号 {backup['name']} 已接替 {failed_account['name']}"
+                )
+                return new_worker
+
+            async def worker_loop(worker):
+                while self.running:
+                    if worker['paused']:
+                        # 如果队列已空，直接退出，避免 gather 永远等待被暂停的 worker
+                        if phone_queue.empty():
+                            return
+                        await asyncio.sleep(2)
+                        continue
                     try:
-                        result = await self.resolve_phone_result(filter_obj, phone, self.country)
-                        results.append(result)
-
-                        status = self.get_account_status(manager)
-                        self.status_signal.emit(status)
-
-                        display_phone = self.get_display_phone(result, phone)
-
-                        if result['registered']:
-                            registered_count += 1
-                            registered_batch.append(self.build_registered_entry(result))
-                            if len(registered_batch) >= self.REGISTERED_CHUNK_SIZE:
-                                self.save_registered_chunk(registered_batch, registered_file_index)
-                                registered_batch = []
-                                registered_file_index += 1
-
-                            status_text = result.get('status') or 'unknown'
-                            last_seen = result.get('last_seen')
-                            retry_suffix = ''
-                            if result.get('recovered_after_retry'):
-                                retry_suffix = f" | 复查后成功({result.get('retry_attempts')})"
-                            if last_seen:
-                                self.log_signal.emit(f"  ✅ 已注册 | {display_phone} | {status_text} | {last_seen}{retry_suffix}")
+                        phone_idx, phone = phone_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    try:
+                        result = await self.process_single_phone(phone_idx, phone, worker, manager)
+                        async with state_lock:
+                            self._accumulate_result(state, result)
+                            # 只推进连续完成前缀
+                            if phone_idx == state['processed']:
+                                state['processed'] += 1
+                                while state['processed'] in completed_ahead:
+                                    completed_ahead.discard(state['processed'])
+                                    state['processed'] += 1
                             else:
-                                self.log_signal.emit(f"  ✅ 已注册 | {display_phone} | {status_text}{retry_suffix}")
-                        else:
-                            active_primary = manager.get_active_primary_accounts()
-                            conflict_handled = False
-                            if len(active_primary) >= 2:
-                                first_primary = active_primary[0]
-                                second_primary = active_primary[1]
-                                second_result = await self.query_with_account(filter_obj, second_primary, phone, self.country)
-                                if second_result.get('registered'):
-                                    conflict_handled = True
-                                    registered_count += 1
-                                    registered_batch.append(self.build_registered_entry(second_result))
-                                    if len(registered_batch) >= self.REGISTERED_CHUNK_SIZE:
-                                        self.save_registered_chunk(registered_batch, registered_file_index)
-                                        registered_batch = []
-                                        registered_file_index += 1
-
-                                    second_display_phone = self.get_display_phone(second_result, phone)
-                                    second_status = second_result.get('status') or 'unknown'
-                                    second_last_seen = second_result.get('last_seen')
-                                    if second_last_seen:
-                                        self.log_signal.emit(f"  ✅ 复核命中 | {second_primary['name']} | {second_display_phone} | {second_status} | {second_last_seen}")
-                                    else:
-                                        self.log_signal.emit(f"  ✅ 复核命中 | {second_primary['name']} | {second_display_phone} | {second_status}")
-
-                                    await self.handle_account_conflict(
-                                        manager,
-                                        filter_obj,
-                                        first_primary,
-                                        second_primary,
-                                        phone,
-                                        second_result,
-                                        i + 1,
-                                        len(self.phones)
-                                    )
-                                elif len(active_primary) >= 3:
-                                    third_primary = active_primary[2]
-                                    third_result = await self.query_with_account(filter_obj, third_primary, phone, self.country)
-                                    if third_result.get('registered'):
-                                        conflict_handled = True
-                                        manager.mark_account_suspected(second_primary, f"miss_before:{third_primary['name']}")
-                                        registered_count += 1
-                                        registered_batch.append(self.build_registered_entry(third_result))
-                                        if len(registered_batch) >= self.REGISTERED_CHUNK_SIZE:
-                                            self.save_registered_chunk(registered_batch, registered_file_index)
-                                            registered_batch = []
-                                            registered_file_index += 1
-
-                                        third_display_phone = self.get_display_phone(third_result, phone)
-                                        third_status = third_result.get('status') or 'unknown'
-                                        third_last_seen = third_result.get('last_seen')
-                                        if third_last_seen:
-                                            self.log_signal.emit(f"  ✅ 三级复核命中 | {first_primary['name']} 未命中 -> {second_primary['name']} 未命中 -> {third_primary['name']} 命中 | {third_display_phone} | {third_status} | {third_last_seen}")
-                                        else:
-                                            self.log_signal.emit(f"  ✅ 三级复核命中 | {first_primary['name']} 未命中 -> {second_primary['name']} 未命中 -> {third_primary['name']} 命中 | {third_display_phone} | {third_status}")
-
-                                        await self.handle_account_conflict(
-                                            manager,
-                                            filter_obj,
-                                            first_primary,
-                                            third_primary,
-                                            phone,
-                                            third_result,
-                                            i + 1,
-                                            len(self.phones)
-                                        )
-                                    else:
-                                        classification, message = self.describe_non_registered_result(result, environment_unstable)
-                                        if classification == 'unregistered':
-                                            unregistered_count += 1
-                                            self.log_signal.emit(f"  ❌ 未注册 | {display_phone} | {message}")
-                                        elif classification == 'invalid':
-                                            self.log_signal.emit(f"  ⚠️ 号码无效 | {display_phone}")
-                                        else:
-                                            uncertain_count += 1
-                                            self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
-                                else:
-                                    classification, message = self.describe_non_registered_result(result, environment_unstable)
-                                    if classification == 'unregistered':
-                                        unregistered_count += 1
-                                        self.log_signal.emit(f"  ❌ 未注册 | {display_phone} | {message}")
-                                    elif classification == 'invalid':
-                                        self.log_signal.emit(f"  ⚠️ 号码无效 | {display_phone}")
-                                    else:
-                                        uncertain_count += 1
-                                        self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
-                            if not active_primary or (len(active_primary) < 2 and not conflict_handled):
-                                classification, message = self.describe_non_registered_result(result, environment_unstable)
-                                if classification == 'unregistered':
-                                    unregistered_count += 1
-                                    self.log_signal.emit(f"  ❌ 未注册 | {display_phone} | {message}")
-                                elif classification == 'invalid':
-                                    self.log_signal.emit(f"  ⚠️ 号码无效 | {display_phone}")
-                                elif not conflict_handled:
-                                    uncertain_count += 1
-                                    self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
-
-                        self.save_progress(
-                            i + 1,
-                            registered_count,
-                            unregistered_count,
-                            registered_batch,
-                            registered_file_index,
-                            uncertain_count,
-                            environment_unstable,
-                            probe_failure_count
-                        )
-                        break
+                                completed_ahead.add(phone_idx)
+                            self.save_progress(
+                                state['processed'],
+                                state['registered_count'],
+                                state['unregistered_count'],
+                                state['registered_batch'],
+                                state['registered_file_index'],
+                                state['uncertain_count'],
+                            )
+                        self.status_signal.emit(self.get_account_status(manager))
                     except Exception as e:
-                        error_text = str(e)
-                        if attempt < self.MAX_RETRIES and any(key in error_text.lower() for key in ['reset by peer', 'server closed', 'timed out', 'connection', 'timeout']):
-                            self.log_signal.emit(f"  ⚠️ 网络异常，第 {attempt} 次重试")
-                            await self.reconnect_manager(manager)
-                            continue
-                        self.log_signal.emit(f"  ⚠️ 错误: {error_text}")
-                        self.save_progress(
-                            i,
-                            registered_count,
-                            unregistered_count,
-                            registered_batch,
-                            registered_file_index,
-                            uncertain_count,
-                            environment_unstable,
-                            probe_failure_count
-                        )
-                        await manager.disconnect_all()
+                        self.log_signal.emit(f"  ⚠️ worker 异常: {e}")
+                    finally:
+                        phone_queue.task_done()
+
+            async def probe_loop():
+                if self.probe_interval <= 0 or not self.probe_phones:
+                    return
+                done_probes = 0
+                while self.running:
+                    await asyncio.sleep(3)
+                    async with state_lock:
+                        processed = state['processed']
+                    expected = max(0, (processed - start_index) // self.probe_interval)
+                    while done_probes < expected and self.running:
+                        done_probes += 1
+                        active = [w for w in workers if not w['paused']]
+                        if not active:
+                            break
+                        probe_worker = active[(done_probes - 1) % len(active)]
+                        probe_phone = self.probe_phones[(done_probes - 1) % len(self.probe_phones)]
+                        acc_name = probe_worker['account']['name']
+                        self.log_signal.emit(f"[探针{done_probes}] {acc_name} 验证 {probe_phone}...")
+                        try:
+                            probe_result = await self.query_with_account(
+                                probe_worker['filter'], probe_worker['account'], probe_phone, self.country
+                            )
+                            if probe_result.get('registered'):
+                                probe_worker['probe_failures'] = 0
+                                self.log_signal.emit(f"  [探针{done_probes}] ✅ {acc_name} 正常")
+                            else:
+                                probe_worker['probe_failures'] += 1
+                                _, msg = self.describe_non_registered_result(probe_result, False)
+                                self.log_signal.emit(
+                                    f"  [探针{done_probes}] ❓ {acc_name} 未命中 "
+                                    f"({probe_worker['probe_failures']}/{self.PROBE_FAILURE_THRESHOLD}) | {msg}"
+                                )
+                                if probe_worker['probe_failures'] >= self.PROBE_FAILURE_THRESHOLD:
+                                    probe_worker['paused'] = True
+                                    try:
+                                        manager.pause_account(probe_worker['account'], 'probe_failure')
+                                    except Exception:
+                                        pass
+                                    self.log_signal.emit(
+                                        f"  ⏸️ 账号 {acc_name} 探针连续失败，已暂停该账号（其他账号继续）"
+                                    )
+                                    promote_backup(probe_worker['account'], 'probe_failure')
+                        except Exception as e:
+                            probe_worker['probe_failures'] += 1
+                            self.log_signal.emit(f"  [探针{done_probes}] ⚠️ {acc_name} 网络异常: {e}")
+                            if probe_worker['probe_failures'] >= self.PROBE_FAILURE_THRESHOLD:
+                                probe_worker['paused'] = True
+                                try:
+                                    manager.pause_account(probe_worker['account'], 'probe_network_error')
+                                except Exception:
+                                    pass
+                                self.log_signal.emit(f"  ⏸️ 账号 {acc_name} 探针连续异常，已暂停该账号")
+                                promote_backup(probe_worker['account'], 'probe_network_error')
+
+                    # 所有账号都挂了才紧急停止
+                    if all(w['paused'] for w in workers):
+                        self.log_signal.emit("  ⛔ 所有账号探针均异常，紧急停止")
+                        probe_phone = self.probe_phones[0] if self.probe_phones else ''
+                        self.probe_anomaly_signal.emit(probe_phone, state['processed'], len(self.phones))
+                        self.running = False
                         return
 
-                # ── 探针验证：每隔 N 个号静默检查一次 ──
-                if self.running and self.probe_interval > 0 and self.probe_phones:
-                    probe_idx = (i + 1) // self.probe_interval
-                    if (i + 1) % self.probe_interval == 0 and probe_idx > 0:
-                        probe_phone = self.probe_phones[(probe_idx - 1) % len(self.probe_phones)]
-                        self.log_signal.emit(f"[探针{probe_idx}] 验证 {probe_phone}...")
-                        try:
-                            probe_result = await self.resolve_phone_result(filter_obj, probe_phone, self.country)
-                            probe_original = probe_result.get('original_phone') or probe_phone
-                            probe_formatted = probe_result.get('phone') or probe_phone
-                            probe_display = probe_formatted if probe_formatted == probe_original else f"{probe_original} -> {probe_formatted}"
-                            if probe_result['registered']:
-                                probe_failure_count = 0
-                                if environment_unstable:
-                                    self.log_signal.emit(f"  [探针{probe_idx}] ✅ {probe_display} 已恢复正常")
-                                else:
-                                    self.log_signal.emit(f"  [探针{probe_idx}] ✅ {probe_display} 已注册（正常）")
-                                environment_unstable = False
-                            else:
-                                probe_failure_count += 1
-                                environment_unstable = probe_failure_count >= self.PROBE_FAILURE_THRESHOLD
-                                _, probe_message = self.describe_non_registered_result(probe_result, environment_unstable)
-                                self.log_signal.emit(f"  [探针{probe_idx}] ❓ {probe_display} 未确认 | {probe_message}")
-                                if environment_unstable:
-                                    self.log_signal.emit(f"  [探针{probe_idx}] ⚠️ 当前查询环境已标记为不稳定")
-                        except Exception as e:
-                            probe_failure_count += 1
-                            environment_unstable = probe_failure_count >= self.PROBE_FAILURE_THRESHOLD
-                            self.log_signal.emit(f"  [探针{probe_idx}] ⚠️ {probe_phone} 网络异常: {e}")
+                    if phone_queue.empty():
+                        return
 
-            if registered_batch:
-                self.save_registered_chunk(registered_batch, registered_file_index)
+            # 启动 workers + probe（running_tasks 动态增长以容纳替补 worker）
+            for w in workers:
+                running_tasks.append(asyncio.create_task(worker_loop(w)))
+            running_tasks.append(asyncio.create_task(probe_loop()))
 
-            self.clear_progress()
+            while True:
+                alive = [t for t in running_tasks if not t.done()]
+                if not alive:
+                    break
+                await asyncio.wait(alive, return_when=asyncio.FIRST_COMPLETED)
+
+            for t in running_tasks:
+                if t.done() and not t.cancelled():
+                    exc = t.exception()
+                    if exc:
+                        self.log_signal.emit(f"  ⚠️ 任务异常: {exc}")
+
+            # 收尾：刷 registered_batch
+            async with state_lock:
+                if state['registered_batch']:
+                    self.save_registered_chunk(state['registered_batch'], state['registered_file_index'])
+                    state['registered_batch'] = []
+
+            if self.running and state['processed'] >= len(self.phones):
+                self.clear_progress()
+
             self.log_signal.emit(
-                f"✅ 筛选完成！共 {len(self.phones)} 个号码，已注册 {registered_count} 个，未确认 {uncertain_count} 个，未注册 {unregistered_count} 个"
+                f"✅ 筛选完成！共 {len(self.phones)} 个号码，已注册 {state['registered_count']} 个，"
+                f"未确认 {state['uncertain_count']} 个，未注册 {state['unregistered_count']} 个"
             )
 
         except Exception as e:
@@ -896,23 +986,13 @@ class FilterThread(QThread):
             self.log_signal.emit(f"详细错误: {error_trace}")
 
             # 发送到远程日志
-            if local_logger:
-                local_logger.error(f"筛选过程异常: {str(e)}")
-
             if remote_logger:
-                try:
-                    remote_logger.error(
-                        "筛选过程异常",
-                        exception=str(e),
-                        traceback=error_trace,
-                        phone_count=len(self.phones),
-                        current_index=i if 'i' in locals() else 0
-                    )
-                    if local_logger:
-                        local_logger.info("远程日志发送成功")
-                except Exception as log_err:
-                    if local_logger:
-                        local_logger.error("远程日志发送失败", log_err)
+                remote_logger.error(
+                    "筛选过程异常",
+                    exception=str(e),
+                    traceback=error_trace,
+                    phone_count=len(self.phones),
+                )
         finally:
             if manager:
                 try:
@@ -955,9 +1035,6 @@ class TelegramFilterGUI(QMainWindow):
     def init_remote_logger(self):
         """初始化远程日志"""
         global remote_logger
-        if local_logger:
-            local_logger.info("开始初始化远程日志")
-
         if remote_logger is None:
             # 默认使用内置的 Bot Token 和 Chat ID（收集所有用户日志）
             default_bot_token = "8726232685:AAH6tLEKREjMZ2iXtphkThhir8YIh7xuK_0"
@@ -969,25 +1046,24 @@ class TelegramFilterGUI(QMainWindow):
             chat_id = log_config.get('chat_id', default_chat_id)
             enabled = log_config.get('enabled', True)  # 默认启用
 
-            if local_logger:
-                local_logger.info(f"远程日志配置: enabled={enabled}, bot_token={'已设置' if bot_token else '未设置'}, chat_id={chat_id}")
-
             if bot_token and chat_id and enabled:
                 try:
-                    remote_logger = init_remote_logger_func(bot_token, chat_id, enabled)
-                    remote_logger.info("筛号工具已启动")
-                    if local_logger:
-                        local_logger.info("远程日志初始化成功，已发送启动消息")
+                    if init_remote_logger is not None:
+                        remote_logger = init_remote_logger(bot_token, chat_id, enabled)
+                        if remote_logger:
+                            remote_logger.info("筛号工具已启动")
+                    else:
+                        with open('remote_logger_error.log', 'a', encoding='utf-8') as f:
+                            f.write(f"\n[{datetime.now()}] init_remote_logger 函数未定义，远程日志模块可能导入失败\n")
                 except Exception as e:
-                    if local_logger:
-                        local_logger.error("远程日志初始化失败", e)
-            else:
-                if local_logger:
-                    local_logger.warning("远程日志未启用或配置不完整")
+                    with open('remote_logger_error.log', 'a', encoding='utf-8') as f:
+                        f.write(f"\n[{datetime.now()}] 远程日志初始化异常: {e}\n")
+                        import traceback
+                        f.write(traceback.format_exc())
 
     def load_account_login_status(self):
         for acc in self.config.get('accounts', []):
-            session_file = f"session_{acc['name']}.session"
+            session_file = get_session_path(acc['name']) + '.session'
             self.account_status[acc['name']] = {
                 'login_state': 'logged_in' if os.path.exists(session_file) else 'not_logged_in',
                 'proxy_state': 'not_configured'
@@ -1234,6 +1310,14 @@ class TelegramFilterGUI(QMainWindow):
         self.req_spin.setFont(QFont('Arial', 11))
         form.addRow("单账号请求上限:", self.req_spin)
 
+        total_accounts = len(self.config.get('accounts', []))
+        self.primary_count_spin = QSpinBox()
+        self.primary_count_spin.setRange(1, max(1, total_accounts))
+        current_pc = self.config.get('primary_count') or total_accounts or 1
+        self.primary_count_spin.setValue(max(1, min(current_pc, max(1, total_accounts))))
+        self.primary_count_spin.setFont(QFont('Arial', 11))
+        form.addRow(f"并发工作号数量 (共 {total_accounts} 个号):", self.primary_count_spin)
+
         self.min_spin = QSpinBox()
         self.min_spin.setRange(1, 10)
         self.min_spin.setValue(self.config['rate_limit']['min_delay'])
@@ -1265,21 +1349,14 @@ class TelegramFilterGUI(QMainWindow):
             self.log(f"✅ 已导入 {filename}")
 
     def start_filtering(self):
-        if local_logger:
-            local_logger.info("User clicked start filtering button")
-
         if self.filter_thread and self.filter_thread.isRunning():
             # 停止筛选
-            if local_logger:
-                local_logger.info("Stop filtering task")
             self.filter_thread.stop()
             self.start_btn.setText("🚀 开始筛选")
             self.start_btn.setStyleSheet("background: #4CAF50; color: white; padding: 10px;")
             return
 
         if not self.config.get('accounts'):
-            if local_logger:
-                local_logger.warning("Start filtering failed: no accounts configured")
             QMessageBox.critical(self, "错误", "请先在'账号管理'中添加账号")
             return
 
@@ -1287,22 +1364,15 @@ class TelegramFilterGUI(QMainWindow):
             self.account_status.get(name, {}).get('login_state') == 'logged_in'
             for name in self.account_status
         ):
-            if local_logger:
-                local_logger.warning("Start filtering failed: no logged in accounts")
-            QMessageBox.critical(self, "错误", "请先在'账号管理'中选中账号并点击\"登录选中账号\"")
+            QMessageBox.critical(self, "错误", "请先在'账号管理'中选中账号并点击“登录选中账号”")
             return
 
         phones = [p.strip() for p in self.phone_text.toPlainText().split('\n') if p.strip()]
         if not phones:
-            if local_logger:
-                local_logger.warning("Start filtering failed: no phone numbers")
             QMessageBox.critical(self, "错误", "请输入手机号")
             return
 
         country = "US" if self.country_group.checkedId() == 0 else "CN"
-
-        if local_logger:
-            local_logger.info(f"Start filtering task: country={country}, phone_count={len(phones)}")
 
         # 读取探针配置
         probe_interval = getattr(self, 'probe_interval_spin', None) and self.probe_interval_spin.value() or 0
@@ -1449,7 +1519,7 @@ class TelegramFilterGUI(QMainWindow):
         # 检查是否有未登录的账号
         not_logged_in = []
         for acc in accounts:
-            session_file = f"session_{acc['name']}.session"
+            session_file = get_session_path(acc['name']) + '.session'
             if not os.path.exists(session_file):
                 not_logged_in.append(acc)
 
@@ -1676,14 +1746,28 @@ class TelegramFilterGUI(QMainWindow):
         accounts = self.config.get('accounts', [])
         self.account_table.setRowCount(len(accounts))
 
+        primary_count = self.config.get('primary_count') or len(accounts)
+        try:
+            primary_count = int(primary_count)
+        except (TypeError, ValueError):
+            primary_count = len(accounts)
+        primary_count = max(1, min(primary_count, len(accounts))) if accounts else 0
+
+        if hasattr(self, 'primary_count_spin') and accounts:
+            self.primary_count_spin.blockSignals(True)
+            self.primary_count_spin.setRange(1, len(accounts))
+            if self.primary_count_spin.value() > len(accounts):
+                self.primary_count_spin.setValue(len(accounts))
+            self.primary_count_spin.blockSignals(False)
+
         for i, acc in enumerate(accounts):
             self.account_table.setItem(i, 0, QTableWidgetItem(acc['name']))
             self.account_table.setItem(i, 1, QTableWidgetItem(acc['phone']))
             self.account_table.setItem(i, 2, QTableWidgetItem("0"))
             self.set_account_login_state(i, acc['name'])
             self.set_account_proxy_state(i, acc['name'])
-            role = '工作号' if i < 3 else '备用号'
-            runtime_state = '活跃' if i < 3 else '待命'
+            role = '工作号' if i < primary_count else '备用号'
+            runtime_state = '活跃' if i < primary_count else '待命'
             self.account_table.setItem(i, 5, QTableWidgetItem(role))
             self.account_table.setItem(i, 6, QTableWidgetItem(runtime_state))
             self.account_table.setItem(i, 7, QTableWidgetItem("-"))
@@ -1822,7 +1906,7 @@ class TelegramFilterGUI(QMainWindow):
             return
 
         # 删除会话文件
-        session_file = f"session_{name}.session"
+        session_file = get_session_path(name) + '.session'
         if os.path.exists(session_file):
             os.remove(session_file)
 
@@ -1872,7 +1956,9 @@ class TelegramFilterGUI(QMainWindow):
         self.config['rate_limit']['requests_per_account'] = self.req_spin.value()
         self.config['rate_limit']['min_delay'] = self.min_spin.value()
         self.config['rate_limit']['max_delay'] = self.max_spin.value()
+        self.config['primary_count'] = self.primary_count_spin.value()
         save_config(self.config)
+        self.refresh_account_table()
         QMessageBox.information(self, "成功", "设置已保存")
 
     def log(self, msg):
@@ -1887,12 +1973,60 @@ class TelegramFilterGUI(QMainWindow):
         event.accept()
 
 
+def exception_hook(exctype, value, tb):
+    """全局异常处理 - 捕获所有未处理的异常并记录到文件"""
+    import traceback
+    error_msg = ''.join(traceback.format_exception(exctype, value, tb))
+
+    # 写入崩溃日志文件
+    crash_log_path = 'crash.log'
+    try:
+        with open(crash_log_path, 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"程序崩溃 - {datetime.now()}\n")
+            f.write(f"{'='*60}\n")
+            f.write(error_msg)
+            f.write(f"\n{'='*60}\n\n")
+    except:
+        pass
+
+    # 尝试发送到远程日志
+    try:
+        if remote_logger:
+            remote_logger.critical("程序崩溃", exception=value)
+    except:
+        pass
+
+    # 显示错误对话框（如果 GUI 可用）
+    try:
+        from PyQt5.QtWidgets import QMessageBox
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Critical)
+        msg.setWindowTitle("程序错误")
+        msg.setText(f"程序遇到错误:\n\n{str(value)}\n\n详细信息已保存到 {crash_log_path}")
+        msg.exec_()
+    except:
+        pass
+
+    # 调用默认的异常处理
+    sys.__excepthook__(exctype, value, tb)
+
+
 def main():
-    app = QApplication(sys.argv)
-    app.setApplicationName("TelegramFilter")
-    gui = TelegramFilterGUI()
-    gui.show()
-    sys.exit(app.exec_())
+    # 设置全局异常处理
+    sys.excepthook = exception_hook
+
+    try:
+        app = QApplication(sys.argv)
+        app.setApplicationName("TelegramFilter")
+        gui = TelegramFilterGUI()
+        gui.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        # 捕获主函数中的异常
+        exception_hook(type(e), e, e.__traceback__)
+        raise
+
 
 if __name__ == '__main__':
     main()

@@ -2,11 +2,24 @@
 多账号管理模块
 """
 import json
+import os
+import sys
 import asyncio
 import random
 from datetime import datetime, timedelta
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
+
+
+def _get_app_dir():
+    """session 文件所在目录：EXE 打包时为 EXE 所在目录，否则为脚本目录。"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _get_session_path(name):
+    return os.path.join(_get_app_dir(), f"session_{name}")
 
 
 class AccountManager:
@@ -48,9 +61,19 @@ class AccountManager:
         self._initialize_account_roles()
 
     def _initialize_account_roles(self):
+        raw = self.config.get('primary_count')
+        try:
+            primary_count = int(raw) if raw else len(self.accounts)
+        except (TypeError, ValueError):
+            primary_count = len(self.accounts)
+        if self.accounts:
+            primary_count = max(1, min(primary_count, len(self.accounts)))
+        else:
+            primary_count = 0
         for idx, account in enumerate(self.accounts):
-            account['role'] = 'primary' if idx < 3 else 'backup'
-            account['runtime_state'] = 'active' if idx < 3 else 'standby'
+            is_primary = idx < primary_count
+            account['role'] = 'primary' if is_primary else 'backup'
+            account['runtime_state'] = 'active' if is_primary else 'standby'
             account['suspected_count'] = 0
             account['replacement_history'] = []
             self.role_assignments[account['role']].append(account['name'])
@@ -144,7 +167,7 @@ class AccountManager:
                     print(f"  使用代理: {proxy['host']}:{proxy['port']}")
 
                 client = TelegramClient(
-                    f"session_{account['name']}",
+                    _get_session_path(account['name']),
                     account['api_id'],
                     account['api_hash'],
                     proxy=proxy_config
