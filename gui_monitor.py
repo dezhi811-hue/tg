@@ -529,7 +529,8 @@ class FilterThread(QThread):
         return {
             'phone': result.get('phone'),
             'status': result.get('status'),
-            'last_seen': result.get('last_seen')
+            'last_seen': result.get('last_seen'),
+            'username': result.get('username')
         }
 
     def classify_activity_group(self, entry):
@@ -556,10 +557,13 @@ class FilterThread(QThread):
         phone = entry.get('phone') or ''
         status = entry.get('status') or 'unknown'
         last_seen = entry.get('last_seen')
+        username = entry.get('username')
+
+        phone_field = f"{phone} @{username}" if username else phone
 
         if last_seen:
-            return f"{phone} | {status} | {last_seen}"
-        return f"{phone} | {status}"
+            return f"{phone_field} | {status} | {last_seen}"
+        return f"{phone_field} | {status}"
 
     def format_registered_chunk(self, entries):
         grouped = {
@@ -1008,6 +1012,40 @@ class FilterThread(QThread):
         self.running = False
 
 
+class UpdateCheckThread(QThread):
+    """后台查询 GitHub Release 最新版本。"""
+    finished_signal = pyqtSignal(bool, dict, str)  # ok, info, error
+
+    def run(self):
+        try:
+            import updater
+            info = updater.check_update()
+            self.finished_signal.emit(True, info, "")
+        except Exception as e:
+            self.finished_signal.emit(False, {}, str(e))
+
+
+class UpdateApplyThread(QThread):
+    """下载并启动替换脚本。成功后由主线程负责退出进程。"""
+    progress_signal = pyqtSignal(int, int)  # done, total
+    finished_signal = pyqtSignal(bool, str)  # ok, error
+
+    def __init__(self, url, parent=None):
+        super().__init__(parent)
+        self.url = url
+
+    def run(self):
+        try:
+            import updater
+            updater.apply_update(
+                self.url,
+                progress_cb=lambda d, t: self.progress_signal.emit(d, t)
+            )
+            self.finished_signal.emit(True, "")
+        except Exception as e:
+            self.finished_signal.emit(False, str(e))
+
+
 class TelegramFilterGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1078,12 +1116,29 @@ class TelegramFilterGUI(QMainWindow):
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
 
-        # 顶部标题
+        # 顶部标题 + 检查更新按钮
+        header_widget = QWidget()
+        header_widget.setStyleSheet("background: #2196F3;")
+        header_layout = QHBoxLayout(header_widget)
+        header_layout.setContentsMargins(15, 10, 15, 10)
+
         header = QLabel("🚀 Telegram 筛号工具")
         header.setFont(QFont('Arial', 18, QFont.Bold))
-        header.setStyleSheet("background: #2196F3; color: white; padding: 15px;")
+        header.setStyleSheet("color: white;")
         header.setAlignment(Qt.AlignCenter)
-        main_layout.addWidget(header)
+        header_layout.addWidget(header, 1)
+
+        self.update_btn = QPushButton("🔄 检查更新")
+        self.update_btn.setStyleSheet(
+            "QPushButton { background: white; color: #2196F3; padding: 6px 14px;"
+            " border-radius: 4px; font-weight: bold; }"
+            "QPushButton:hover { background: #E3F2FD; }"
+            "QPushButton:disabled { color: #999; }"
+        )
+        self.update_btn.clicked.connect(self.on_check_update_clicked)
+        header_layout.addWidget(self.update_btn, 0)
+
+        main_layout.addWidget(header_widget)
 
         # 标签页
         tabs = QTabWidget()
@@ -1971,6 +2026,89 @@ class TelegramFilterGUI(QMainWindow):
             self.filter_thread.stop()
             self.filter_thread.wait()
         event.accept()
+
+    # ---------------- 自动更新 ----------------
+
+    def on_check_update_clicked(self):
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("检查中...")
+        self._update_check_thread = UpdateCheckThread(self)
+        self._update_check_thread.finished_signal.connect(self._on_update_check_done)
+        self._update_check_thread.start()
+
+    def _on_update_check_done(self, ok, info, error):
+        self.update_btn.setEnabled(True)
+        self.update_btn.setText("🔄 检查更新")
+        if not ok:
+            QMessageBox.warning(self, "检查更新失败", f"无法获取最新版本信息：\n{error}")
+            return
+
+        current = info.get("current")
+        latest = info.get("latest")
+        if not info.get("has_update"):
+            QMessageBox.information(self, "已是最新版本",
+                                    f"当前版本 v{current} 已是最新（远端 {latest}）。")
+            return
+
+        notes = (info.get("notes") or "").strip()
+        if len(notes) > 600:
+            notes = notes[:600] + "\n..."
+
+        msg = (f"发现新版本：{latest}\n"
+               f"当前版本：v{current}\n\n"
+               f"{notes}\n\n"
+               f"是否立即下载并安装？安装完成后程序会自动重启。")
+        reply = QMessageBox.question(self, "发现新版本", msg,
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        from updater import is_frozen
+        if not is_frozen():
+            QMessageBox.warning(self, "无法自动更新",
+                                "当前以源码模式运行，请使用 git pull 更新，或下载打包版本后再点更新。")
+            return
+
+        if not info.get("download_url"):
+            QMessageBox.warning(self, "下载失败", "最新 Release 中未找到 Windows 安装包。")
+            return
+
+        self._start_download(info["download_url"])
+
+    def _start_download(self, url):
+        from PyQt5.QtWidgets import QProgressDialog
+        self._progress_dlg = QProgressDialog("正在下载更新...", "取消", 0, 100, self)
+        self._progress_dlg.setWindowTitle("更新中")
+        self._progress_dlg.setWindowModality(Qt.WindowModal)
+        self._progress_dlg.setAutoClose(False)
+        self._progress_dlg.setAutoReset(False)
+        self._progress_dlg.setValue(0)
+        self._progress_dlg.show()
+
+        self._update_apply_thread = UpdateApplyThread(url, self)
+        self._update_apply_thread.progress_signal.connect(self._on_download_progress)
+        self._update_apply_thread.finished_signal.connect(self._on_apply_done)
+        self._update_apply_thread.start()
+
+    def _on_download_progress(self, done, total):
+        if total > 0:
+            pct = int(done * 100 / total)
+            self._progress_dlg.setValue(pct)
+            self._progress_dlg.setLabelText(
+                f"正在下载更新... {done // 1024} KB / {total // 1024} KB"
+            )
+        else:
+            self._progress_dlg.setLabelText(f"正在下载更新... {done // 1024} KB")
+
+    def _on_apply_done(self, ok, error):
+        self._progress_dlg.close()
+        if not ok:
+            QMessageBox.critical(self, "更新失败", f"{error}")
+            return
+        QMessageBox.information(self, "更新就绪",
+                                "新版本已下载完成，程序将退出以完成更新。\n"
+                                "几秒后会自动启动新版本。")
+        QApplication.quit()
 
 
 def exception_hook(exctype, value, tb):
