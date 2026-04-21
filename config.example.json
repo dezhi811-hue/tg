@@ -29,6 +29,6 @@
     "requests_per_account": 50,
     "min_delay": 1,
     "max_delay": 4,
-    "error_cooldown": 30
+    "error_cooldown": 900
   }
 }

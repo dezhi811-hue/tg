@@ -7,7 +7,7 @@ import json
 import os
 import asyncio
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QTextEdit, QTabWidget,
@@ -851,6 +851,21 @@ class FilterThread(QThread):
 
             async def worker_loop(worker):
                 while self.running:
+                    acc = worker['account']
+                    if acc.get('is_blocked'):
+                        block_until = acc.get('block_until')
+                        if block_until and datetime.now() < block_until:
+                            if phone_queue.empty():
+                                return
+                            await asyncio.sleep(2)
+                            continue
+                        acc['is_blocked'] = False
+                        acc['block_until'] = None
+                        try:
+                            manager.activate_account(acc, reason='cooldown_expired')
+                        except Exception:
+                            pass
+                        self.log_signal.emit(f"  ▶️ {acc['name']} 冷却结束，恢复筛号")
                     if worker['paused']:
                         # 如果队列已空，直接退出，避免 gather 永远等待被暂停的 worker
                         if phone_queue.empty():
@@ -898,7 +913,14 @@ class FilterThread(QThread):
                     expected = max(0, (processed - start_index) // self.probe_interval)
                     while done_probes < expected and self.running:
                         done_probes += 1
-                        active = [w for w in workers if not w['paused']]
+                        now = datetime.now()
+                        active = [
+                            w for w in workers
+                            if not w['paused']
+                            and not (w['account'].get('is_blocked')
+                                     and w['account'].get('block_until')
+                                     and now < w['account']['block_until'])
+                        ]
                         if not active:
                             break
                         probe_worker = active[(done_probes - 1) % len(active)]
@@ -920,29 +942,30 @@ class FilterThread(QThread):
                                     f"({probe_worker['probe_failures']}/{self.PROBE_FAILURE_THRESHOLD}) | {msg}"
                                 )
                                 if probe_worker['probe_failures'] >= self.PROBE_FAILURE_THRESHOLD:
-                                    probe_worker['paused'] = True
-                                    try:
-                                        manager.pause_account(probe_worker['account'], 'probe_failure')
-                                    except Exception:
-                                        pass
+                                    cooldown = int(self.config.get('rate_limit', {}).get('error_cooldown', 300))
+                                    acc_obj = probe_worker['account']
+                                    acc_obj['is_blocked'] = True
+                                    acc_obj['block_until'] = datetime.now() + timedelta(seconds=cooldown)
+                                    probe_worker['probe_failures'] = 0
                                     self.log_signal.emit(
-                                        f"  ⏸️ 账号 {acc_name} 探针连续失败，已暂停该账号（其他账号继续）"
+                                        f"  🧊 账号 {acc_name} 探针连续失败，冷却 {cooldown}s 后自动恢复"
                                     )
-                                    promote_backup(probe_worker['account'], 'probe_failure')
                         except Exception as e:
                             probe_worker['probe_failures'] += 1
                             self.log_signal.emit(f"  [探针{done_probes}] ⚠️ {acc_name} 网络异常: {e}")
                             if probe_worker['probe_failures'] >= self.PROBE_FAILURE_THRESHOLD:
-                                probe_worker['paused'] = True
-                                try:
-                                    manager.pause_account(probe_worker['account'], 'probe_network_error')
-                                except Exception:
-                                    pass
-                                self.log_signal.emit(f"  ⏸️ 账号 {acc_name} 探针连续异常，已暂停该账号")
-                                promote_backup(probe_worker['account'], 'probe_network_error')
+                                cooldown = int(self.config.get('rate_limit', {}).get('error_cooldown', 300))
+                                acc_obj = probe_worker['account']
+                                acc_obj['is_blocked'] = True
+                                acc_obj['block_until'] = datetime.now() + timedelta(seconds=cooldown)
+                                probe_worker['probe_failures'] = 0
+                                self.log_signal.emit(
+                                    f"  🧊 账号 {acc_name} 探针连续异常，冷却 {cooldown}s 后自动恢复"
+                                )
 
-                    # 所有账号都挂了才紧急停止
-                    if all(w['paused'] for w in workers):
+                    # 所有账号都挂了才紧急停止（保留原有 paused 分支，无人会触发；
+                    # 冷却机制下只要等待就能恢复，不主动紧急停止）
+                    if workers and all(w['paused'] for w in workers):
                         self.log_signal.emit("  ⛔ 所有账号探针均异常，紧急停止")
                         probe_phone = self.probe_phones[0] if self.probe_phones else ''
                         self.probe_anomaly_signal.emit(probe_phone, state['processed'], len(self.phones))
