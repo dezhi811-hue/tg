@@ -1,5 +1,17 @@
 # Telegram筛号工具 - 更新日志
 
+## v3.0.1 - username 输出 + GUI 自动更新 (2026-04-22)
+
+### 新增功能
+- ✅ **`registered_XXX.txt` 追加 username** - 每行手机号后拼接 `@username`（仅当对方设置了公开用户名），方便事后直接联系；没设置的用户保持原格式
+- ✅ **GUI 检查更新按键** - 顶栏右上角"🔄 检查更新"一键检测 GitHub 最新 Release，新版本下载并自动替换 `.exe`，完成后自动重启（仅 Windows 打包版）
+- ✅ **版本常量** - 新增 `version.py`，今后每次发版改一行即可
+
+### 内部改动
+- 新增 `updater.py`：GitHub API 查询 + 下载 + Windows `.bat` 自替换脚本
+- `build_config.spec` 纳入 `updater` / `version` 模块
+- 仓库改为 Public 以支持匿名 API 访问（无需在 exe 里嵌入 token）
+
 ## v3.0 - 队列并发 + 备用号自动替补 (2026-04-21)
 
 ### 新增功能

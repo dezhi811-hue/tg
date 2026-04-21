@@ -12,12 +12,26 @@
 - ✅ **防封策略** - 账号切换、请求限制、FloodWait处理
 - ✅ 批量筛选支持
 - ✅ 结果导出（CSV/JSON）
+- ✅ **已注册号自动分组** - 按活跃度（近 1 个月 / 1-6 个月 / 更久）分段写入 `registered_XXX.txt`，行末追加 `@username`（若有）
+- ✅ **GUI 一键检查更新** - 顶栏"🔄 检查更新"按键自动从 GitHub Release 下载最新 `.exe` 并重启（仅 Windows 打包版）
 
 ## 安装
 
+### Windows 用户（推荐）
+
+直接下载打包好的 exe，无需安装 Python：
+
+👉 **[最新版本下载（v3.0.1）](https://github.com/dezhi811-hue/tg/releases/latest)**
+
+下载 `TelegramFilter-Windows.zip` 解压后双击 `TelegramFilter.exe` 即可运行。
+以后新版本直接在 GUI 顶栏点"🔄 检查更新"自动下载。
+
+### 源码运行（开发者）
+
 ```bash
-cd /Volumes/waijie/tg/telegram_filter
+cd /Volumes/waijie/tg
 pip install -r requirements.txt
+python run_gui.py
 ```
 
 ## 配置
@@ -124,6 +138,7 @@ python main.py --phone +12025551234
 
 ## 输出结果
 
+### CSV 导出
 CSV文件包含以下字段：
 - `phone`: 格式化后的号码
 - `original_phone`: 原始输入号码
@@ -143,6 +158,35 @@ CSV文件包含以下字段：
 - `last_seen`: 最后上线时间
 - `is_bot`: 是否为机器人
 - `error`: 错误信息
+
+### 已注册号分组文件 `registered_XXX.txt`
+
+筛选过程中 GUI 会按批次把**已注册**的号码写入 `registered_001.txt`、`registered_002.txt` ……按活跃度分成三段：
+
+```
+📅 近一个月内活跃
++12025551234 @john_doe | recently | 2026-04-20 18:30:00
++14085559876 @alice99 | online | 2026-04-21 09:15:00
+
+📅 1-6 个月内活跃
++12025550000 | within_month | 2026-03-01 10:00:00
+
+📅 半年以上未活跃
++12025557777 | long_ago
+```
+
+每行格式：`手机号 @用户名 | 活跃状态 | 最后上线时间`。用户没有公开 username 时省略 `@xxx`。
+
+## 自动更新（仅 Windows .exe 版）
+
+GUI 顶栏点击 **🔄 检查更新**：
+
+1. 程序向 GitHub 查询最新 Release
+2. 发现新版本弹窗显示更新说明
+3. 点确认 → 自动下载 `TelegramFilter-Windows.zip` 并解压
+4. 当前程序退出 → 后台脚本替换 exe → 自动启动新版本
+
+**注意**：源码模式运行（`python run_gui.py`）不会触发自动更新，请用 `git pull`。
 
 ## 防封策略
 
