@@ -771,9 +771,19 @@ class FilterThread(QThread):
             await manager.connect_all()
 
             active_primary = manager.get_active_primary_accounts()
-            if not active_primary:
+            # 严格按配置并发数执行：只保留真正连接上的号
+            connected_primary = [a for a in active_primary if a.get('client')]
+            target_concurrency = len(active_primary)
+            real_concurrency = len(connected_primary)
+            if not connected_primary:
                 self.log_signal.emit("❌ 没有可用的primary账号")
                 return
+            if real_concurrency < target_concurrency:
+                self.log_signal.emit(
+                    f"⚠️ 设定并发 {target_concurrency}，仅 {real_concurrency} 个号连接成功，"
+                    f"本轮以 {real_concurrency} 并发运行"
+                )
+            active_primary = connected_primary
 
             self.log_signal.emit(f"🔥 启用 {len(active_primary)} 个账号并发查询（队列模式）")
 
@@ -781,12 +791,16 @@ class FilterThread(QThread):
             for account in active_primary:
                 limiter = RateLimiter(self.config['rate_limit'])
                 filter_obj = TelegramFilter(manager, limiter)
+                # 把 filter 的 manager 固定到本 worker 的账号，避免所有 worker 都
+                # 走 manager.get_next_account() 挤到同一个账号上
+                filter_obj.manager = _PinnedAccountManager(manager, account)
                 workers.append({
                     'account': account,
                     'limiter': limiter,
                     'filter': filter_obj,
                     'paused': False,
                     'probe_failures': 0,
+                    'last_probe_id': 0,
                 })
 
             # 恢复进度
@@ -799,6 +813,7 @@ class FilterThread(QThread):
                 'registered_batch': [],
                 'registered_file_index': 1,
                 'processed': 0,
+                'finished_total': 0,
             }
             if progress:
                 start_index = progress.get('next_index', 0)
@@ -835,12 +850,14 @@ class FilterThread(QThread):
                     return None
                 new_limiter = RateLimiter(self.config['rate_limit'])
                 new_filter = TelegramFilter(manager, new_limiter)
+                new_filter.manager = _PinnedAccountManager(manager, backup)
                 new_worker = {
                     'account': backup,
                     'limiter': new_limiter,
                     'filter': new_filter,
                     'paused': False,
                     'probe_failures': 0,
+                    'last_probe_id': 0,
                 }
                 workers.append(new_worker)
                 running_tasks.append(asyncio.create_task(worker_loop(new_worker)))
@@ -872,6 +889,18 @@ class FilterThread(QThread):
                             return
                         await asyncio.sleep(2)
                         continue
+                    # 单账号请求上限到了 → 进入冷却，避免持续猛薅同一个号
+                    req_cap = int(self.config.get('rate_limit', {}).get('requests_per_account', 30))
+                    if acc.get('request_count', 0) >= req_cap:
+                        cooldown = int(self.config.get('rate_limit', {}).get('error_cooldown', 300))
+                        acc['is_blocked'] = True
+                        acc['block_until'] = datetime.now() + timedelta(seconds=cooldown)
+                        acc['block_count'] = acc.get('block_count', 0) + 1
+                        acc['request_count'] = 0
+                        self.log_signal.emit(
+                            f"  🧊 {acc['name']} 达到单号请求上限 {req_cap}，冷却 {cooldown}s 后恢复"
+                        )
+                        continue
                     try:
                         phone_idx, phone = phone_queue.get_nowait()
                     except asyncio.QueueEmpty:
@@ -880,6 +909,7 @@ class FilterThread(QThread):
                         result = await self.process_single_phone(phone_idx, phone, worker, manager)
                         async with state_lock:
                             self._accumulate_result(state, result)
+                            state['finished_total'] += 1
                             # 只推进连续完成前缀
                             if phone_idx == state['processed']:
                                 state['processed'] += 1
@@ -906,11 +936,12 @@ class FilterThread(QThread):
                 if self.probe_interval <= 0 or not self.probe_phones:
                     return
                 done_probes = 0
+                total_remaining = len(self.phones) - start_index
                 while self.running:
                     await asyncio.sleep(3)
                     async with state_lock:
-                        processed = state['processed']
-                    expected = max(0, (processed - start_index) // self.probe_interval)
+                        finished = state['finished_total']
+                    expected = finished // self.probe_interval
                     while done_probes < expected and self.running:
                         done_probes += 1
                         now = datetime.now()
@@ -923,7 +954,11 @@ class FilterThread(QThread):
                         ]
                         if not active:
                             break
-                        probe_worker = active[(done_probes - 1) % len(active)]
+                        # 公平轮询：挑"上次被探针抽到最早"的 worker，永远不会因为
+                        # 某号短暂冷却就长期漏检
+                        probe_worker = min(active, key=lambda w: w['last_probe_id'])
+                        probe_worker['last_probe_id'] = done_probes
+                        probe_worker['account']['probe_count'] = probe_worker['account'].get('probe_count', 0) + 1
                         probe_phone = self.probe_phones[(done_probes - 1) % len(self.probe_phones)]
                         acc_name = probe_worker['account']['name']
                         self.log_signal.emit(f"[探针{done_probes}] {acc_name} 验证 {probe_phone}...")
@@ -946,6 +981,7 @@ class FilterThread(QThread):
                                     acc_obj = probe_worker['account']
                                     acc_obj['is_blocked'] = True
                                     acc_obj['block_until'] = datetime.now() + timedelta(seconds=cooldown)
+                                    acc_obj['block_count'] = acc_obj.get('block_count', 0) + 1
                                     probe_worker['probe_failures'] = 0
                                     self.log_signal.emit(
                                         f"  🧊 账号 {acc_name} 探针连续失败，冷却 {cooldown}s 后自动恢复"
@@ -958,6 +994,7 @@ class FilterThread(QThread):
                                 acc_obj = probe_worker['account']
                                 acc_obj['is_blocked'] = True
                                 acc_obj['block_until'] = datetime.now() + timedelta(seconds=cooldown)
+                                acc_obj['block_count'] = acc_obj.get('block_count', 0) + 1
                                 probe_worker['probe_failures'] = 0
                                 self.log_signal.emit(
                                     f"  🧊 账号 {acc_name} 探针连续异常，冷却 {cooldown}s 后自动恢复"
@@ -972,7 +1009,8 @@ class FilterThread(QThread):
                         self.running = False
                         return
 
-                    if phone_queue.empty():
+                    # 所有号都跑完了才退出，避免 phone_queue 先空导致探针提前结束
+                    if finished >= total_remaining:
                         return
 
             # 启动 workers + probe（running_tasks 动态增长以容纳替补 worker）
@@ -1005,6 +1043,12 @@ class FilterThread(QThread):
                 f"✅ 筛选完成！共 {len(self.phones)} 个号码，已注册 {state['registered_count']} 个，"
                 f"未确认 {state['uncertain_count']} 个，未注册 {state['unregistered_count']} 个"
             )
+
+            # 收尾 emit 一次最终快照，让 GUI 看到最终的探针次数 / 封禁数
+            try:
+                self.status_signal.emit(self.get_account_status(manager))
+            except Exception:
+                pass
 
         except Exception as e:
             import traceback
@@ -1281,7 +1325,7 @@ class TelegramFilterGUI(QMainWindow):
         self.account_table = QTableWidget()
         self.account_table.setColumnCount(9)
         self.account_table.setHorizontalHeaderLabels([
-            "账号名称", "手机号", "请求次数", "登录状态", "代理状态", "角色", "运行状态", "封禁至", "统计"
+            "账号名称", "手机号", "探针次数", "登录状态", "代理状态", "角色", "运行状态", "封禁数", "统计"
         ])
         self.account_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.account_table.setFont(QFont('Arial', 10))
@@ -1848,7 +1892,7 @@ class TelegramFilterGUI(QMainWindow):
             runtime_state = '活跃' if i < primary_count else '待命'
             self.account_table.setItem(i, 5, QTableWidgetItem(role))
             self.account_table.setItem(i, 6, QTableWidgetItem(runtime_state))
-            self.account_table.setItem(i, 7, QTableWidgetItem("-"))
+            self.account_table.setItem(i, 7, QTableWidgetItem("0"))
             self.account_table.setItem(i, 8, QTableWidgetItem("0/0"))
 
     def set_account_login_state(self, row, name):
@@ -1999,32 +2043,48 @@ class TelegramFilterGUI(QMainWindow):
 
     def update_account_status(self, status_dict):
         """更新账号状态（从筛选线程接收）"""
+        active_count = 0
+        target_count = 0
         for i in range(self.account_table.rowCount()):
             name = self.account_table.item(i, 0).text()
             if name in status_dict:
                 status = status_dict[name]
 
-                self.account_table.setItem(i, 2, QTableWidgetItem(str(status['requests'])))
+                # 探针次数
+                self.account_table.setItem(i, 2, QTableWidgetItem(str(status.get('probe_count', 0))))
+                # 封禁数（累计）
+                self.account_table.setItem(i, 7, QTableWidgetItem(str(status.get('block_count', 0))))
 
-                if status['blocked']:
-                    status_item = QTableWidgetItem("🚫 封禁中")
-                    status_item.setForeground(QColor('red'))
-                    self.account_table.setItem(i, 3, status_item)
-                    self.account_table.setItem(i, 7, QTableWidgetItem(status['block_until'] or "-"))
-                else:
-                    self.set_account_login_state(i, name)
-                    self.set_account_proxy_state(i, name)
-                    self.account_table.setItem(i, 7, QTableWidgetItem("-"))
+                # 登录/代理列不因冷却切换状态（避免"红色封禁中"覆盖登录状态）
+                self.set_account_login_state(i, name)
+                self.set_account_proxy_state(i, name)
 
-                role_text = {'primary': '工作号', 'backup': '备用号'}.get(status.get('role'), '工作号')
-                runtime_text = {
-                    'active': '活跃',
-                    'standby': '待命',
-                    'suspected': '疑似异常',
-                    'paused': '已暂停'
-                }.get(status.get('runtime_state'), '活跃')
+                role = status.get('role', 'primary')
+                role_text = {'primary': '工作号', 'backup': '备用号'}.get(role, '工作号')
                 self.account_table.setItem(i, 5, QTableWidgetItem(role_text))
-                self.account_table.setItem(i, 6, QTableWidgetItem(runtime_text))
+
+                # 运行状态：冷却中优先级最高，带倒计时
+                if status.get('blocked') and status.get('block_until'):
+                    runtime_item = QTableWidgetItem(f"🧊 冷却至 {status['block_until']}")
+                    runtime_item.setForeground(QColor('#FF9800'))
+                else:
+                    runtime_text = {
+                        'active': '🟢 活跃',
+                        'standby': '⚪ 待命',
+                        'suspected': '🟡 疑似异常',
+                        'paused': '⏸️ 已暂停'
+                    }.get(status.get('runtime_state'), '🟢 活跃')
+                    runtime_item = QTableWidgetItem(runtime_text)
+                self.account_table.setItem(i, 6, runtime_item)
+
+                if role == 'primary':
+                    target_count += 1
+                    if status.get('runtime_state') == 'active' and not status.get('blocked'):
+                        active_count += 1
+
+        # 标题显示实时并发
+        if target_count > 0:
+            self.setWindowTitle(f"Telegram 筛号工具 — 实时并发 {active_count}/{target_count}")
 
     def update_account_display(self):
         """定时更新显示（用于倒计时等）"""

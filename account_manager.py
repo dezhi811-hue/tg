@@ -41,6 +41,8 @@ class AccountManager:
                 'proxy': acc_config.get('proxy', {}),
                 'client': None,
                 'request_count': 0,
+                'probe_count': 0,
+                'block_count': 0,
                 'last_request_time': None,
                 'is_blocked': False,
                 'block_until': None
@@ -147,6 +149,8 @@ class AccountManager:
                 'role': account.get('role', 'primary'),
                 'runtime_state': account.get('runtime_state', 'active'),
                 'requests': account['request_count'],
+                'probe_count': account.get('probe_count', 0),
+                'block_count': account.get('block_count', 0),
                 'blocked': account['is_blocked'],
                 'block_until': account['block_until'].strftime('%H:%M:%S') if account['block_until'] else None,
                 'suspected_count': account.get('suspected_count', 0)
@@ -242,6 +246,7 @@ class AccountManager:
             wait_seconds = error_type.seconds
             account['is_blocked'] = True
             account['block_until'] = datetime.now() + timedelta(seconds=wait_seconds)
+            account['block_count'] = account.get('block_count', 0) + 1
             print(f"🚫 {account['name']} 触发速率限制，暂停 {wait_seconds} 秒")
 
     def mark_account_success(self, account):
