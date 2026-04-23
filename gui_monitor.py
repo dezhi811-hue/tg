@@ -374,8 +374,9 @@ class FilterThread(QThread):
     REGISTERED_CHUNK_SIZE = 200
     PROGRESS_FILE = 'filter_progress.json'
     MAX_RETRIES = 3
-    EMPTY_RESULT_RETRIES = 2
     PROBE_FAILURE_THRESHOLD = 2
+    CONSECUTIVE_EMPTY_TRIGGER = 15  # 单账号连续空返回达此阈值 → 触发定向探针确诊
+    EMPTY_PROBE_COOLDOWN_SEC = 600  # 空返探针未命中/复验失败的冷却时长（10 分钟）
     RECENT_SECTION_TITLE = '近期在线'
     MID_SECTION_TITLE = '一个月到半年在线'
     OLD_SECTION_TITLE = '长期未在线'
@@ -605,13 +606,12 @@ class FilterThread(QThread):
         except Exception:
             return None
 
-    def save_progress(self, next_index, registered_count, unregistered_count, registered_batch, registered_file_index, uncertain_count=0, environment_unstable=False, probe_failure_count=0):
+    def save_progress(self, next_index, registered_count, unregistered_count, registered_batch, registered_file_index, environment_unstable=False, probe_failure_count=0):
         progress = {
             'phones': self.phones,
             'next_index': next_index,
             'registered_count': registered_count,
             'unregistered_count': unregistered_count,
-            'uncertain_count': uncertain_count,
             'registered_batch': registered_batch,
             'registered_file_index': registered_file_index,
             'environment_unstable': environment_unstable,
@@ -637,30 +637,8 @@ class FilterThread(QThread):
         self.log_signal.emit('✅ 自动重连成功，继续筛选')
 
     async def resolve_phone_result(self, filter_obj, phone, country):
-        attempts = []
-        max_attempts = self.EMPTY_RESULT_RETRIES + 1
-
-        for attempt in range(1, max_attempts + 1):
-            result = await filter_obj.check_phone(phone, country)
-            attempts.append(result)
-            if result.get('registered'):
-                if attempt > 1:
-                    result['recovered_after_retry'] = True
-                    result['retry_attempts'] = attempt
-                return result
-
-            if result.get('query_state') != 'empty_result':
-                result['retry_attempts'] = attempt
-                return result
-
-            if attempt < max_attempts:
-                self.log_signal.emit(f"  🔄 空返回复查 {attempt}/{self.EMPTY_RESULT_RETRIES}")
-
-        final_result = attempts[-1]
-        final_result['retry_attempts'] = max_attempts
-        final_result['query_state'] = 'uncertain'
-        final_result['error'] = '连续空返回，结果未确认'
-        return final_result
+        # 两态模式下不再做同账号复查，直接单次查询返回
+        return await filter_obj.check_phone(phone, country)
 
     async def process_single_phone(self, phone_idx, phone, worker, manager):
         """处理单个号码（队列 worker 调用）"""
@@ -676,43 +654,16 @@ class FilterThread(QThread):
             if result['registered']:
                 status_text = result.get('status') or 'unknown'
                 last_seen = result.get('last_seen')
-                retry_suffix = ''
-                if result.get('recovered_after_retry'):
-                    retry_suffix = f" | 复查后成功({result.get('retry_attempts')})"
+                username = result.get('username')
+                uname_suffix = f" | @{username}" if username else ''
                 if last_seen:
-                    self.log_signal.emit(f"  ✅ 已注册 | {display_phone} | {status_text} | {last_seen}{retry_suffix}")
+                    self.log_signal.emit(f"  ✅ 已注册 | {display_phone}{uname_suffix} | {status_text} | {last_seen}")
                 else:
-                    self.log_signal.emit(f"  ✅ 已注册 | {display_phone} | {status_text}{retry_suffix}")
+                    self.log_signal.emit(f"  ✅ 已注册 | {display_phone}{uname_suffix} | {status_text}")
                 return result
 
-            # 判断结果类型（不再使用全局 environment_unstable）
-            classification, message = self.describe_non_registered_result(result, False)
-
-            # 只在 uncertain 状态才复核
-            if classification == 'uncertain':
-                active_primary = manager.get_active_primary_accounts()
-                if len(active_primary) >= 2:
-                    for verify_account in active_primary:
-                        if verify_account['name'] == worker['account']['name']:
-                            continue
-                        verify_result = await self.query_with_account(worker['filter'], verify_account, phone, self.country)
-                        if verify_result.get('registered'):
-                            verify_display = self.get_display_phone(verify_result, phone)
-                            verify_status = verify_result.get('status') or 'unknown'
-                            verify_last_seen = verify_result.get('last_seen')
-                            if verify_last_seen:
-                                self.log_signal.emit(f"  ✅ 复核命中 | {verify_account['name']} | {verify_display} | {verify_status} | {verify_last_seen}")
-                            else:
-                                self.log_signal.emit(f"  ✅ 复核命中 | {verify_account['name']} | {verify_display} | {verify_status}")
-                            return verify_result
-
-            result['classification'] = classification
-            if classification == 'unregistered':
-                self.log_signal.emit(f"  ❌ 未注册 | {display_phone} | {message}")
-            elif classification == 'invalid':
-                self.log_signal.emit(f"  ⚠️ 号码无效 | {display_phone}")
-            else:
-                self.log_signal.emit(f"  ❓ 未确认 | {display_phone} | {message}")
+            result['classification'] = 'unregistered'
+            self.log_signal.emit(f"  ❌ 未注册 | {display_phone}")
             return result
 
         except Exception as e:
@@ -720,7 +671,7 @@ class FilterThread(QThread):
             return None
 
     def _accumulate_result(self, state, result):
-        """将单次查询结果累加到共享状态（调用方持有 state_lock）。"""
+        """将单次查询结果累加到共享状态（调用方持有 state_lock）。两态：命中 / 未注册。"""
         if result is None:
             return
         if result.get('registered'):
@@ -731,27 +682,86 @@ class FilterThread(QThread):
                 state['registered_batch'] = []
                 state['registered_file_index'] += 1
         else:
-            classification = result.get('classification', 'uncertain')
-            if classification == 'unregistered':
-                state['unregistered_count'] += 1
-            elif classification == 'uncertain':
-                state['uncertain_count'] += 1
+            state['unregistered_count'] += 1
 
     def describe_non_registered_result(self, result, environment_unstable):
-        query_state = result.get('query_state')
-        if query_state == 'invalid':
-            return 'invalid', '号码无效'
-        if query_state == 'rate_limited':
-            return 'uncertain', result.get('error') or '触发速率限制'
-        if query_state == 'query_failed':
-            return 'uncertain', result.get('error') or '查询失败'
-        if query_state in {'empty_result', 'uncertain'}:
-            if environment_unstable:
-                return 'uncertain', '查询环境不稳定，结果未确认'
-            return 'uncertain', result.get('error') or '查询未返回用户'
-        if query_state == 'unregistered':
-            return 'unregistered', result.get('error') or '未注册Telegram'
-        return 'uncertain', result.get('error') or '结果未确认'
+        # 两态：命中（registered，调用方已单独处理）→ 这里只返回未注册
+        return 'unregistered', result.get('error') or '未注册Telegram'
+
+    async def _trigger_on_demand_probe(self, worker, manager):
+        """连续空返回达阈值时调用：用当前账号查一个已知注册的探针号。
+        命中 → 账号没问题，继续；
+        未命中 / 没配探针 → 疑似账号被限，冷却 10 分钟，期满前还要再跑一次探针复验。
+        """
+        acc = worker['account']
+        acc_name = acc['name']
+        cooldown = self.EMPTY_PROBE_COOLDOWN_SEC
+
+        if not self.probe_phones:
+            acc['is_blocked'] = True
+            acc['block_until'] = datetime.now() + timedelta(seconds=cooldown)
+            acc['block_count'] = acc.get('block_count', 0) + 1
+            worker['needs_recheck_probe'] = True
+            self.log_signal.emit(
+                f"  🧊 {acc_name} 连续 {self.CONSECUTIVE_EMPTY_TRIGGER} 次空返回（未配探针号，保守冷却 {cooldown//60} 分钟）"
+            )
+            return
+
+        probe_phone = self.probe_phones[0]
+        acc['probe_count'] = acc.get('probe_count', 0) + 1
+        self.log_signal.emit(
+            f"  🔍 {acc_name} 连续 {self.CONSECUTIVE_EMPTY_TRIGGER} 次空返回，触发定向探针 → {probe_phone}"
+        )
+        try:
+            probe_result = await self.query_with_account(
+                worker['filter'], acc, probe_phone, self.country
+            )
+            if probe_result.get('registered'):
+                self.log_signal.emit(f"  ✅ 定向探针命中，{acc_name} 状态正常，继续筛号")
+                return
+            _, msg = self.describe_non_registered_result(probe_result, False)
+            self.log_signal.emit(f"  ❌ 定向探针未命中 | {acc_name} | {msg}")
+        except Exception as e:
+            self.log_signal.emit(f"  ⚠️ 定向探针异常 | {acc_name} | {e}")
+
+        acc['is_blocked'] = True
+        acc['block_until'] = datetime.now() + timedelta(seconds=cooldown)
+        acc['block_count'] = acc.get('block_count', 0) + 1
+        worker['needs_recheck_probe'] = True
+        self.log_signal.emit(f"  🧊 {acc_name} 确认异常，停 {cooldown//60} 分钟后再复验探针")
+
+    async def _probe_after_cooldown(self, worker, manager):
+        """冷却期满后的复验探针：命中 → 放行恢复筛号；未命中 → 再冷却 10 分钟。
+        返回 True 表示可以恢复筛号，False 表示账号仍异常，继续冷却。
+        """
+        acc = worker['account']
+        acc_name = acc['name']
+        cooldown = self.EMPTY_PROBE_COOLDOWN_SEC
+
+        if not self.probe_phones:
+            # 没探针号，没法复验 → 乐观放行（由后续空返回再触发）
+            return True
+
+        probe_phone = self.probe_phones[0]
+        acc['probe_count'] = acc.get('probe_count', 0) + 1
+        self.log_signal.emit(f"  🔁 {acc_name} 冷却结束，复验探针 → {probe_phone}")
+        try:
+            probe_result = await self.query_with_account(
+                worker['filter'], acc, probe_phone, self.country
+            )
+            if probe_result.get('registered'):
+                self.log_signal.emit(f"  ✅ 复验探针命中，{acc_name} 恢复筛号")
+                return True
+            _, msg = self.describe_non_registered_result(probe_result, False)
+            self.log_signal.emit(f"  ❌ 复验探针仍未命中 | {acc_name} | {msg}")
+        except Exception as e:
+            self.log_signal.emit(f"  ⚠️ 复验探针异常 | {acc_name} | {e}")
+
+        acc['is_blocked'] = True
+        acc['block_until'] = datetime.now() + timedelta(seconds=cooldown)
+        acc['block_count'] = acc.get('block_count', 0) + 1
+        self.log_signal.emit(f"  🧊 {acc_name} 仍异常，再停 {cooldown//60} 分钟")
+        return False
 
     async def filter_task(self):
         """异步筛选任务 - 队列 + 常驻 worker 模式
@@ -801,6 +811,7 @@ class FilterThread(QThread):
                     'paused': False,
                     'probe_failures': 0,
                     'last_probe_id': 0,
+                    'consecutive_empty': 0,
                 })
 
             # 恢复进度
@@ -809,7 +820,6 @@ class FilterThread(QThread):
             state = {
                 'registered_count': 0,
                 'unregistered_count': 0,
-                'uncertain_count': 0,
                 'registered_batch': [],
                 'registered_file_index': 1,
                 'processed': 0,
@@ -819,7 +829,6 @@ class FilterThread(QThread):
                 start_index = progress.get('next_index', 0)
                 state['registered_count'] = progress.get('registered_count', 0)
                 state['unregistered_count'] = progress.get('unregistered_count', 0)
-                state['uncertain_count'] = progress.get('uncertain_count', 0)
                 state['registered_batch'] = progress.get('registered_batch', [])
                 state['registered_file_index'] = progress.get('registered_file_index', 1)
                 state['processed'] = start_index
@@ -858,6 +867,7 @@ class FilterThread(QThread):
                     'paused': False,
                     'probe_failures': 0,
                     'last_probe_id': 0,
+                    'consecutive_empty': 0,
                 }
                 workers.append(new_worker)
                 running_tasks.append(asyncio.create_task(worker_loop(new_worker)))
@@ -878,6 +888,12 @@ class FilterThread(QThread):
                             continue
                         acc['is_blocked'] = False
                         acc['block_until'] = None
+                        # 若该账号是因空返探针失败被冷却的，期满要再探针一次确认
+                        if worker.get('needs_recheck_probe'):
+                            ok = await self._probe_after_cooldown(worker, manager)
+                            if not ok:
+                                continue  # 仍异常，再等一轮冷却
+                            worker['needs_recheck_probe'] = False
                         try:
                             manager.activate_account(acc, reason='cooldown_expired')
                         except Exception:
@@ -924,8 +940,17 @@ class FilterThread(QThread):
                                 state['unregistered_count'],
                                 state['registered_batch'],
                                 state['registered_file_index'],
-                                state['uncertain_count'],
                             )
+                        # 空返回计数：命中清零；未注册累加（账号被限时会连续 15 次）
+                        if result is not None:
+                            if result.get('registered'):
+                                worker['consecutive_empty'] = 0
+                            else:
+                                worker['consecutive_empty'] = worker.get('consecutive_empty', 0) + 1
+                        # 达到阈值 → 触发定向探针确诊是否 D（账号被限）
+                        if worker.get('consecutive_empty', 0) >= self.CONSECUTIVE_EMPTY_TRIGGER:
+                            worker['consecutive_empty'] = 0
+                            await self._trigger_on_demand_probe(worker, manager)
                         self.status_signal.emit(self.get_account_status(manager))
                     except Exception as e:
                         self.log_signal.emit(f"  ⚠️ worker 异常: {e}")
@@ -1041,7 +1066,7 @@ class FilterThread(QThread):
 
             self.log_signal.emit(
                 f"✅ 筛选完成！共 {len(self.phones)} 个号码，已注册 {state['registered_count']} 个，"
-                f"未确认 {state['uncertain_count']} 个，未注册 {state['unregistered_count']} 个"
+                f"未注册 {state['unregistered_count']} 个"
             )
 
             # 收尾 emit 一次最终快照，让 GUI 看到最终的探针次数 / 封禁数
@@ -1441,13 +1466,13 @@ class TelegramFilterGUI(QMainWindow):
         form.addRow(f"并发工作号数量 (共 {total_accounts} 个号):", self.primary_count_spin)
 
         self.min_spin = QSpinBox()
-        self.min_spin.setRange(1, 10)
+        self.min_spin.setRange(1, 60)
         self.min_spin.setValue(self.config['rate_limit']['min_delay'])
         self.min_spin.setFont(QFont('Arial', 11))
         form.addRow("最小延迟(秒):", self.min_spin)
 
         self.max_spin = QSpinBox()
-        self.max_spin.setRange(5, 30)
+        self.max_spin.setRange(5, 120)
         self.max_spin.setValue(self.config['rate_limit']['max_delay'])
         self.max_spin.setFont(QFont('Arial', 11))
         form.addRow("最大延迟(秒):", self.max_spin)
