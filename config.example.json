@@ -10,7 +10,13 @@
         "port": 1080,
         "username": "",
         "password": ""
-      }
+      },
+      "_device_fingerprint_hint": "可选：device_model / system_version / app_version / lang_code / system_lang_code，未填则按账号序号从内置指纹池稳定分配",
+      "device_model": "",
+      "system_version": "",
+      "app_version": "",
+      "lang_code": "",
+      "system_lang_code": ""
     },
     {
       "name": "account2",
@@ -27,8 +33,12 @@
   ],
   "rate_limit": {
     "requests_per_account": 50,
-    "min_delay": 1,
-    "max_delay": 4,
-    "error_cooldown": 900
+    "min_delay": 20,
+    "max_delay": 30,
+    "error_cooldown": 900,
+    "_防封控开关": "以下字段为批次二新增，默认值已是保守推荐值",
+    "use_resolve_phone": false,
+    "silent_read_interval": 10,
+    "reset_contacts_interval": 50
   }
 }

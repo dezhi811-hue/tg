@@ -9,12 +9,13 @@ import os
 import sys
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
+from account_manager import resolve_device_profile, build_proxy_config
 
 
 def get_config_path():
     """获取 config.json 路径，支持 EXE 打包和相对路径"""
     if getattr(sys, 'frozen', False):
-        base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+        base = os.path.dirname(sys.executable)
     else:
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, 'config.json')
@@ -34,19 +35,19 @@ async def main():
     acc = accounts[0]
     session_name = f"session_{acc['name']}"
 
-    # 支持代理
-    proxy = acc.get('proxy', {})
-    proxy_config = None
-    if proxy and proxy.get('host'):
-        proxy_config = ('socks5', proxy['host'], proxy['port'],
-                       proxy.get('username', ''), proxy.get('password', ''))
-        print(f"  使用代理: {proxy['host']}:{proxy['port']}")
+    proxy_config = build_proxy_config(acc.get('proxy'))
+    if proxy_config:
+        print(f"  使用代理: {proxy_config[1]}:{proxy_config[2]}")
+
+    fp = resolve_device_profile(acc)
+    print(f"  使用设备指纹: {fp['device_model']} / {fp['system_version']}")
 
     client = TelegramClient(
         session_name,
         int(acc['api_id']),
         acc['api_hash'],
-        proxy=proxy_config
+        proxy=proxy_config,
+        **fp,
     )
 
     await client.connect()

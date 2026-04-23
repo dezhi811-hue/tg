@@ -1,5 +1,52 @@
 # Telegram筛号工具 - 更新日志
 
+## v3.1.0 - 防封控大修 + 关键 bug 修复 (2026-04-24)
+
+### 🔴 关键 bug 修复（批次一）
+- **`get_config_path` EXE 模式路径错误**：之前用 `sys._MEIPASS`（PyInstaller 临时解压目录），导致用户在 exe 旁边修改的 `config.json` 永远不生效，跑的是打包时嵌进去的老默认值。这就是为什么实际筛号间隔是 7–8 秒而不是设置的 20–30 秒。现已改用 `sys.executable` 目录。
+- **空返不计数导致单号被猛薅**：账号被风控开始全空返后，`request_count` 永远 = 0 → 单号冷却永远不触发 → 死循环。现在空返也 `mark_account_used`。
+- **探针/单号上限冷却时长不一致**：定时探针失败冷却 15 分钟，空返探针冷却 10 分钟。统一为 **10 分钟**（`EMPTY_PROBE_COOLDOWN_SEC = 600`）。
+- **`load_config` fallback 值过激进**：读不到 config.json 时 fallback `min_delay=3, max_delay=8`，与预期差太远。修正为 20/30。
+
+### 🛡️ 防封控大修（批次二）
+
+- **每账号设备指纹差异化**：引入 6 套内置指纹池（iPhone 14 Pro / iPhone 15 / Samsung / Pixel / MacBook / Windows 桌面），按账号 name 稳定 hash 分配。同一账号每次启动固定指纹，不同账号差异化。用户也可在 `config.json` 每账号显式配置 `device_model / system_version / app_version / lang_code / system_lang_code` 覆盖。
+- **`InputPhoneContact` 字段随机化**：`client_id` 从固定 0 改为随机整数，`first_name` 从固定 'User' 改为从常见英文名池随机挑。消除 Telegram 风控最容易识别的静态特征。
+- **代理配置修正**：
+  - 6 元组（socks5, host, port, **rdns=True**, user, pass）确保 DNS 也走代理，不再泄露真实 IP
+  - port 强制转 int（JSON 字符串 port 也兼容）
+  - 空字符串 username/password 改成 None，修复"以空密码认证"失败
+- **连接后 `get_me()` 校验**：代理或网络问题立即暴露，不再等到筛号时才失败
+- **FloodWait 指数退避**：触发一次冷却 `wait × 1`，第 N 次触发 `wait × 2^(N-1)`，封顶 2 小时。避免反复踩同一账号。
+- **`ResolvePhoneRequest` 开关**：`rate_limit.use_resolve_phone = true` 时走 Resolve（不入联系人簿，配额比 Import 松）。默认关闭，保持原 Import 语义（"能加为联系人"）。
+- **静默读**：`rate_limit.silent_read_interval` 控制每 N 次查询穿插一次 `GetDialogsRequest`（默认 10），让风控看到"真人在用客户端"的行为。
+- **周期清联系人簿**：`rate_limit.reset_contacts_interval` 控制每 N 次查询调一次 `ResetSavedRequest`（默认 50），兜底 `DeleteContactsRequest` 未及时清理的遗留。
+- **单号请求上限冷却也统一 10 分钟**
+
+### 新增配置字段（全部可选）
+
+```json
+"rate_limit": {
+  "use_resolve_phone": false,
+  "silent_read_interval": 10,
+  "reset_contacts_interval": 50
+}
+```
+
+每账号还可加 `device_model / system_version / app_version / lang_code / system_lang_code`。
+
+### 注意事项
+- 现有 session 是 Telethon 默认指纹登录的，升级后重连时指纹会变，Telegram 会把这次当"设备更新"。这是**一次性事件**，之后每次都稳定。
+- 打包时**不要把 config.json 嵌进 exe**，让它必须是 exe 旁的那份（已修复路径解析，可以直接读到）。
+- 新增 `test_batch12_sim.py` 覆盖本批次全部改动。
+
+### 修改的文件
+- `filter.py`：核心查询逻辑，新增 4 个 helper 函数
+- `account_manager.py`：新增 `resolve_device_profile` / `build_proxy_config` 两个公共 helper
+- `gui_monitor.py`：`get_config_path`、LoginThread、AccountCheckThread、cooldown 统一
+- `login.py`：同步用公共 helper
+- `config.example.json`：展示新增字段
+
 ## v3.0.4 - 两态结果 + 空返探针 + 慢速筛号 (2026-04-23)
 
 ### 改动

@@ -11,6 +11,55 @@ from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 
+# 设备指纹池：每个账号第一次连接时随机抽一套固定下来，避免所有账号共用一套默认指纹。
+# 2025–2026 Telegram 风控重点之一：多账号同指纹直接扣分。
+_DEVICE_PROFILES = [
+    {"device_model": "iPhone 14 Pro",      "system_version": "17.4",   "app_version": "10.9.1",  "lang_code": "en", "system_lang_code": "en-US"},
+    {"device_model": "iPhone 15",          "system_version": "17.5.1", "app_version": "10.10.0", "lang_code": "en", "system_lang_code": "en-US"},
+    {"device_model": "Samsung SM-G998B",   "system_version": "Android 14", "app_version": "10.9.1", "lang_code": "en", "system_lang_code": "en-US"},
+    {"device_model": "Pixel 7",            "system_version": "Android 14", "app_version": "10.8.3", "lang_code": "en", "system_lang_code": "en-US"},
+    {"device_model": "MacBook Pro",        "system_version": "macOS 14.4", "app_version": "4.16.8", "lang_code": "en", "system_lang_code": "en-US"},
+    {"device_model": "Desktop",            "system_version": "Windows 11", "app_version": "4.16.8", "lang_code": "en", "system_lang_code": "en-US"},
+]
+
+
+def resolve_device_profile(account):
+    """解析账号的设备指纹，返回 dict。
+
+    优先读 account 中的显式字段；缺失则按账号 name 的稳定 hash 从指纹池挑一套，
+    保证同一账号每次启动得到相同指纹，避免 Telegram 风控误判为"设备频繁切换"。
+    """
+    # 稳定 hash：name 相同永远得到同一套指纹
+    name = account.get('name') or ''
+    idx = abs(hash(name)) % len(_DEVICE_PROFILES)
+    profile = _DEVICE_PROFILES[idx]
+    return {
+        'device_model': account.get('device_model') or profile['device_model'],
+        'system_version': account.get('system_version') or profile['system_version'],
+        'app_version': account.get('app_version') or profile['app_version'],
+        'lang_code': account.get('lang_code') or profile['lang_code'],
+        'system_lang_code': account.get('system_lang_code') or profile['system_lang_code'],
+    }
+
+
+def build_proxy_config(proxy):
+    """把 config 里的 proxy dict 转换成 Telethon/PySocks 6 元组；没配返回 None。
+
+    6 元组（而非 5 元组）确保 rdns=True，DNS 也走代理，防止本机 DNS 泄露真实 IP。
+    空字符串的 username/password 改成 None，避免代理以"空密码认证"失败。
+    """
+    if not proxy or not proxy.get('host'):
+        return None
+    return (
+        'socks5',
+        proxy['host'],
+        int(proxy['port']) if proxy.get('port') else 1080,
+        True,
+        (proxy.get('username') or None),
+        (proxy.get('password') or None),
+    )
+
+
 def _get_app_dir():
     """session 文件所在目录：EXE 打包时为 EXE 所在目录，否则为脚本目录。"""
     if getattr(sys, 'frozen', False):
@@ -163,18 +212,20 @@ class AccountManager:
 
         for account in self.accounts:
             try:
-                proxy = account.get('proxy', {})
-                proxy_config = None
-                if proxy and proxy.get('host'):
-                    proxy_config = ('socks5', proxy['host'], proxy['port'],
-                                   proxy.get('username', ''), proxy.get('password', ''))
-                    print(f"  使用代理: {proxy['host']}:{proxy['port']}")
+                proxy_config = build_proxy_config(account.get('proxy'))
+                if proxy_config:
+                    print(f"  {account['name']} 使用代理: {proxy_config[1]}:{proxy_config[2]}")
+                else:
+                    print(f"  ⚠️  {account['name']} 未配置代理，直连 Telegram")
+
+                fp = resolve_device_profile(account)
 
                 client = TelegramClient(
                     _get_session_path(account['name']),
                     account['api_id'],
                     account['api_hash'],
-                    proxy=proxy_config
+                    proxy=proxy_config,
+                    **fp,
                 )
                 await client.connect()
 
@@ -184,8 +235,16 @@ class AccountManager:
                         f"请运行: python3 login.py"
                     )
 
+                # 真正验证代理+登录都 OK：调一次 get_me()，失败立即暴露代理/网络问题
+                try:
+                    me = await client.get_me()
+                    if me is None:
+                        raise RuntimeError("get_me() 返回空")
+                except Exception as ge:
+                    raise RuntimeError(f"账号验证失败（代理或网络问题）: {ge}")
+
                 account['client'] = client
-                print(f"✅ {account['name']} 已连接")
+                print(f"✅ {account['name']} 已连接 | 指纹: {fp['device_model']} | @{getattr(me, 'username', None) or me.phone}")
 
             except Exception as e:
                 print(f"❌ {account['name']} 连接失败: {e}")
@@ -242,12 +301,19 @@ class AccountManager:
         self.account_stats[account['name']]['errors'] += 1
 
         if isinstance(error_type, FloodWaitError):
-            # 触发速率限制，暂时封禁账号
+            # 触发速率限制：指数退避，避免反复触发
+            # block_count 越高冷却越久，封顶 2 小时
             wait_seconds = error_type.seconds
+            block_count = account.get('block_count', 0)
+            backoff_multiplier = 2 ** min(block_count, 6)  # 最多 64x
+            cooldown = min(wait_seconds * backoff_multiplier, 2 * 3600)
             account['is_blocked'] = True
-            account['block_until'] = datetime.now() + timedelta(seconds=wait_seconds)
-            account['block_count'] = account.get('block_count', 0) + 1
-            print(f"🚫 {account['name']} 触发速率限制，暂停 {wait_seconds} 秒")
+            account['block_until'] = datetime.now() + timedelta(seconds=cooldown)
+            account['block_count'] = block_count + 1
+            print(
+                f"🚫 {account['name']} 触发速率限制（原始 {wait_seconds}s × {backoff_multiplier}），"
+                f"实际冷却 {cooldown}s（累计 {account['block_count']} 次）"
+            )
 
     def mark_account_success(self, account):
         """标记账号成功"""

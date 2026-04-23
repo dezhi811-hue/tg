@@ -2,14 +2,29 @@
 号码筛选核心模块 - 支持多账号和智能速率控制
 """
 import asyncio
+import random
 from datetime import datetime
-from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
-from telethon.tl.types import InputPhoneContact
+from telethon.tl.functions.contacts import (
+    ImportContactsRequest,
+    DeleteContactsRequest,
+    ResetSavedRequest,
+    ResolvePhoneRequest,
+)
+from telethon.tl.functions.messages import GetDialogsRequest
+from telethon.tl.types import InputPhoneContact, InputPeerEmpty
 from telethon.errors import (
     PhoneNumberInvalidError,
-    FloodWaitError
+    FloodWaitError,
 )
 from phone_utils import PhoneUtils
+
+
+# 用于 InputPhoneContact.first_name 随机化的常见英文名池，避免所有请求都用 'User'
+_RANDOM_FIRST_NAMES = [
+    'John', 'Mike', 'David', 'Chris', 'Alex', 'James', 'Robert', 'Daniel',
+    'Paul', 'Mark', 'Kevin', 'Brian', 'Steve', 'Tom', 'Sam', 'Jack',
+    'Anna', 'Mary', 'Lisa', 'Emma', 'Sarah', 'Kate', 'Linda', 'Amy',
+]
 
 
 class EmptyQueryResultError(Exception):
@@ -17,9 +32,19 @@ class EmptyQueryResultError(Exception):
 
 
 class TelegramFilter:
-    def __init__(self, manager=None, limiter=None):
+    def __init__(self, manager=None, limiter=None, config=None):
         self.manager = manager
         self.limiter = limiter
+        # 从 config['rate_limit'] 读取防封控开关，默认保守值
+        rl = (config or {}).get('rate_limit', {}) if isinstance(config, dict) else {}
+        # use_resolve_phone: true 时走 ResolvePhoneRequest（不入联系人簿，配额松）
+        # 默认 false，保留原 ImportContactsRequest 行为，老号触顶再手动切
+        self.use_resolve_phone = bool(rl.get('use_resolve_phone', False))
+        # 每账号每 N 次查询插一次静默读（GetDialogs），让风控看到真人行为
+        # 0 或 None 表示关闭
+        self.silent_read_interval = int(rl.get('silent_read_interval', 10) or 0)
+        # 每账号每 N 次查询重置一次联系人簿，保险清理
+        self.reset_contacts_interval = int(rl.get('reset_contacts_interval', 50) or 0)
 
     async def check_phone(self, phone, country='US'):
         """
@@ -92,6 +117,9 @@ class TelegramFilter:
 
             self.manager.mark_account_used(account)
             self.manager.mark_account_success(account)
+            # 命中也穿插静默读与周期清理联系人簿
+            await self._maybe_silent_read(client, account)
+            await self._maybe_reset_contacts(client, account)
 
         except FloodWaitError as e:
             if account:
@@ -102,6 +130,10 @@ class TelegramFilter:
             result['query_state'] = 'invalid'
             result['error'] = '手机号格式无效'
         except EmptyQueryResultError:
+            # 空返也要计数：否则单号被风控持续空返时，request_count 永远 = 0，
+            # 调度器不会触发单号冷却，会变成死循环猛薅一个已经坏了的号。
+            if account:
+                self.manager.mark_account_used(account)
             result['query_state'] = 'empty_result'
             result['error'] = '查询未返回用户'
         except Exception as e:
@@ -113,22 +145,77 @@ class TelegramFilter:
         return result
 
     async def _import_contact_and_get_user(self, client, phone):
+        """根据配置选择 ResolvePhone 或 ImportContacts。
+
+        - ResolvePhone：不入联系人簿，配额松，但对"开启手机号隐私的用户"仍然能查到，
+          语义可能与"能加联系人"略有差异。默认关闭，老号触顶再打开。
+        - ImportContacts：经典语义，命中即表示"可通过手机号加为联系人"。命中后立即删除，
+          避免联系人簿无限增长。
+        """
+        if self.use_resolve_phone:
+            try:
+                res = await client(ResolvePhoneRequest(phone=phone))
+                if not res.users:
+                    raise EmptyQueryResultError('ResolvePhone 未返回用户')
+                return res.users[0]
+            except EmptyQueryResultError:
+                raise
+            except Exception:
+                # Resolve 失败（未注册 / 隐私保护）统一当空返，交由上层判定
+                raise EmptyQueryResultError('ResolvePhone 查询未返回用户')
+
+        # 默认路径：ImportContacts。随机化 client_id 与 first_name，去除静态特征。
         contact = InputPhoneContact(
-            client_id=0,
+            client_id=random.randint(1, 2**31 - 1),
             phone=phone,
-            first_name='User',
-            last_name=''
+            first_name=random.choice(_RANDOM_FIRST_NAMES),
+            last_name='',
         )
         result = await client(ImportContactsRequest(contacts=[contact]))
         if not result.users:
             raise EmptyQueryResultError('查询未返回用户')
 
         user = result.users[0]
+        # 命中后立即删除联系人，避免联系人簿无限增长（触发风控）
         try:
             await client(DeleteContactsRequest(id=[user]))
+        except Exception as de:
+            # 删失败不影响本次结果，但打日志便于排查
+            print(f"⚠️  DeleteContactsRequest 失败: {de}")
+        return user
+
+    async def _maybe_silent_read(self, client, account):
+        """周期性静默读：调 GetDialogs 模拟正常客户端行为，降低风控打分。
+
+        每账号每 N 次查询触发一次，N 由 config.rate_limit.silent_read_interval 控制。
+        """
+        if self.silent_read_interval <= 0:
+            return
+        count = account.get('request_count', 0)
+        if count <= 0 or count % self.silent_read_interval != 0:
+            return
+        try:
+            await client(GetDialogsRequest(
+                offset_date=None,
+                offset_id=0,
+                offset_peer=InputPeerEmpty(),
+                limit=10,
+                hash=0,
+            ))
+        except Exception:
+            pass  # 静默读失败不影响筛号主流程
+
+    async def _maybe_reset_contacts(self, client, account):
+        """周期性清空联系人簿，兜底 DeleteContactsRequest 未及时清理的遗留。"""
+        if self.reset_contacts_interval <= 0:
+            return
+        count = account.get('request_count', 0)
+        if count <= 0 or count % self.reset_contacts_interval != 0:
+            return
+        try:
+            await client(ResetSavedRequest())
         except Exception:
             pass
-        return user
 
     async def _check_phone_impl(self, client, phone, result):
         """实际执行号码检查的内部方法"""

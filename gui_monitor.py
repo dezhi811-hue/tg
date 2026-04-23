@@ -43,9 +43,13 @@ def get_app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 def get_config_path():
-    """获取 config.json 路径，支持 EXE 打包和相对路径"""
+    """获取 config.json 路径，支持 EXE 打包和相对路径
+
+    注意：EXE 模式下必须用 exe 所在目录，而非 _MEIPASS（PyInstaller 临时解压目录）。
+    否则用户在 exe 旁边编辑的 config.json 永远不会生效。
+    """
     if getattr(sys, 'frozen', False):
-        base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+        base = os.path.dirname(sys.executable)
     else:
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, 'config.json')
@@ -101,7 +105,7 @@ def load_config():
                 return json.load(f)
         except:
             pass
-    return {"accounts": [], "rate_limit": {"requests_per_account": 30, "min_delay": 3, "max_delay": 8}}
+    return {"accounts": [], "rate_limit": {"requests_per_account": 50, "min_delay": 20, "max_delay": 30, "error_cooldown": 900}}
 
 def save_config(config):
     """保存配置文件，带备份机制"""
@@ -166,18 +170,17 @@ class LoginThread(QThread):
     async def login_task(self):
         from telethon import TelegramClient
         from telethon.errors import SessionPasswordNeededError
+        from account_manager import resolve_device_profile, build_proxy_config
 
-        proxy = self.account.get('proxy', {})
-        proxy_config = None
-        if proxy and proxy.get('host'):
-            proxy_config = ('socks5', proxy['host'], proxy['port'],
-                          proxy.get('username') or None, proxy.get('password') or None)
+        proxy_config = build_proxy_config(self.account.get('proxy'))
+        fp = resolve_device_profile(self.account)
 
         client = TelegramClient(
             get_session_path(self.account['name']),
             int(self.account['api_id']),
             self.account['api_hash'],
-            proxy=proxy_config
+            proxy=proxy_config,
+            **fp,
         )
 
         fallback_client = None
@@ -190,7 +193,8 @@ class LoginThread(QThread):
                     fallback_client = TelegramClient(
                         get_session_path(self.account['name']),
                         int(self.account['api_id']),
-                        self.account['api_hash']
+                        self.account['api_hash'],
+                        **fp,
                     )
                     await fallback_client.connect()
                     client = fallback_client
@@ -257,6 +261,7 @@ class AccountCheckThread(QThread):
 
     async def _check_single_account(self, account):
         from telethon import TelegramClient
+        from account_manager import resolve_device_profile, build_proxy_config
 
         name = account['name']
         status = {
@@ -265,18 +270,17 @@ class AccountCheckThread(QThread):
         }
 
         try:
-            proxy = account.get('proxy', {})
-            proxy_config = None
-            if proxy and proxy.get('host'):
-                proxy_config = ('socks5', proxy['host'], proxy['port'],
-                              proxy.get('username') or None, proxy.get('password') or None)
+            proxy_config = build_proxy_config(account.get('proxy'))
+            fp = resolve_device_profile(account)
+            if proxy_config:
                 proxy_client = None
                 try:
                     proxy_client = TelegramClient(
                         get_session_path(f"{name}_proxy_check"),
                         int(account['api_id']),
                         account['api_hash'],
-                        proxy=proxy_config
+                        proxy=proxy_config,
+                        **fp,
                     )
                     await proxy_client.connect()
                     if proxy_client.is_connected():
@@ -303,7 +307,8 @@ class AccountCheckThread(QThread):
                 get_session_path(name),
                 int(account['api_id']),
                 account['api_hash'],
-                proxy=proxy_config
+                proxy=proxy_config,
+                **fp,
             )
             try:
                 await client.connect()
@@ -800,7 +805,7 @@ class FilterThread(QThread):
             workers = []
             for account in active_primary:
                 limiter = RateLimiter(self.config['rate_limit'])
-                filter_obj = TelegramFilter(manager, limiter)
+                filter_obj = TelegramFilter(manager, limiter, self.config)
                 # 把 filter 的 manager 固定到本 worker 的账号，避免所有 worker 都
                 # 走 manager.get_next_account() 挤到同一个账号上
                 filter_obj.manager = _PinnedAccountManager(manager, account)
@@ -858,7 +863,7 @@ class FilterThread(QThread):
                     self.log_signal.emit(f"  ⚠️ 升级备用号失败: {e}")
                     return None
                 new_limiter = RateLimiter(self.config['rate_limit'])
-                new_filter = TelegramFilter(manager, new_limiter)
+                new_filter = TelegramFilter(manager, new_limiter, self.config)
                 new_filter.manager = _PinnedAccountManager(manager, backup)
                 new_worker = {
                     'account': backup,
@@ -908,13 +913,13 @@ class FilterThread(QThread):
                     # 单账号请求上限到了 → 进入冷却，避免持续猛薅同一个号
                     req_cap = int(self.config.get('rate_limit', {}).get('requests_per_account', 30))
                     if acc.get('request_count', 0) >= req_cap:
-                        cooldown = int(self.config.get('rate_limit', {}).get('error_cooldown', 300))
+                        cooldown = self.EMPTY_PROBE_COOLDOWN_SEC  # 统一用 10 分钟
                         acc['is_blocked'] = True
                         acc['block_until'] = datetime.now() + timedelta(seconds=cooldown)
                         acc['block_count'] = acc.get('block_count', 0) + 1
                         acc['request_count'] = 0
                         self.log_signal.emit(
-                            f"  🧊 {acc['name']} 达到单号请求上限 {req_cap}，冷却 {cooldown}s 后恢复"
+                            f"  🧊 {acc['name']} 达到单号请求上限 {req_cap}，冷却 {cooldown//60} 分钟后恢复"
                         )
                         continue
                     try:
@@ -1002,27 +1007,27 @@ class FilterThread(QThread):
                                     f"({probe_worker['probe_failures']}/{self.PROBE_FAILURE_THRESHOLD}) | {msg}"
                                 )
                                 if probe_worker['probe_failures'] >= self.PROBE_FAILURE_THRESHOLD:
-                                    cooldown = int(self.config.get('rate_limit', {}).get('error_cooldown', 300))
+                                    cooldown = self.EMPTY_PROBE_COOLDOWN_SEC  # 统一用 10 分钟
                                     acc_obj = probe_worker['account']
                                     acc_obj['is_blocked'] = True
                                     acc_obj['block_until'] = datetime.now() + timedelta(seconds=cooldown)
                                     acc_obj['block_count'] = acc_obj.get('block_count', 0) + 1
                                     probe_worker['probe_failures'] = 0
                                     self.log_signal.emit(
-                                        f"  🧊 账号 {acc_name} 探针连续失败，冷却 {cooldown}s 后自动恢复"
+                                        f"  🧊 账号 {acc_name} 探针连续失败，冷却 {cooldown//60} 分钟后自动恢复"
                                     )
                         except Exception as e:
                             probe_worker['probe_failures'] += 1
                             self.log_signal.emit(f"  [探针{done_probes}] ⚠️ {acc_name} 网络异常: {e}")
                             if probe_worker['probe_failures'] >= self.PROBE_FAILURE_THRESHOLD:
-                                cooldown = int(self.config.get('rate_limit', {}).get('error_cooldown', 300))
+                                cooldown = self.EMPTY_PROBE_COOLDOWN_SEC  # 统一用 10 分钟
                                 acc_obj = probe_worker['account']
                                 acc_obj['is_blocked'] = True
                                 acc_obj['block_until'] = datetime.now() + timedelta(seconds=cooldown)
                                 acc_obj['block_count'] = acc_obj.get('block_count', 0) + 1
                                 probe_worker['probe_failures'] = 0
                                 self.log_signal.emit(
-                                    f"  🧊 账号 {acc_name} 探针连续异常，冷却 {cooldown}s 后自动恢复"
+                                    f"  🧊 账号 {acc_name} 探针连续异常，冷却 {cooldown//60} 分钟后自动恢复"
                                 )
 
                     # 所有账号都挂了才紧急停止（保留原有 paused 分支，无人会触发；
