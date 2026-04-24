@@ -1,5 +1,38 @@
 # Telegram筛号工具 - 更新日志
 
+## v3.2.0 - 批量导入号包 + 代理批量分配 (2026-04-24)
+
+### 🆕 新功能
+
+- **📦 批量导入号包**：账号管理 tab 新增按钮，一键把卖家发的 session+json 号包导进工具
+  - 支持扁平目录（`acc1.session` + `acc1.json`）和子目录布局（`acc1/*.session` + `acc1/info.json`）
+  - 自动扫描目录，识别 session 和配套 json
+  - json 字段模糊匹配：`app_id/api_id`、`app_hash/api_hash`、`device/device_model`、`sdk/system_version` 等常见卖号包字段都能解析
+  - 未提供 json 的号自动套用 `resolve_device_profile`（v3.1.0 的指纹池）按账号名稳定 hash 分配
+- **代理批量粘贴**：一行一条 `host:port:user:pass` 格式，自动解析 + 逐个一对一分配给号
+  - 密码里含冒号自动保留
+  - 代理不足时溢出号直连（弹确认）
+- **首登健康检测**：导入时自动 `connect + is_user_authorized + get_me`，零风控开销
+  - 分类：活号 / 死号-会话失效 / 死号-已封禁 / 死号-已停用 / 代理失败 / 未知错误
+  - 区分错误类型：`AuthKeyUnregistered / SessionRevoked` → session 失效；`UserDeactivatedBan / PhoneNumberBanned` → 账号/手机号被封；`UserDeactivated` → 已停用
+- **死号 CSV 导出**：按卖家售后规则（死号可退、代理问题不可退）一键导出清单
+- **活号写入 config**：只把健康的号写进 config.json，同名覆盖、非同名保留
+- **session 覆盖确认**：目标位置已有同名 session 时弹确认，避免覆盖原登录态
+
+### 新增文件
+- `batch_import.py`：纯逻辑模块（代理解析、号包扫描、json 模糊匹配、健康检测）
+- `test_batch_import.py`：5 组基础单测
+- `test_batch_import_sim.py`：17 组深度模拟（含 `AuthKeyUnregistered / UserDeactivatedBan / PhoneNumberBanned` 全部错误分支 + session 覆盖冲突检测）
+
+### 修改的文件
+- `gui_monitor.py`：新增 `BatchImportThread`、`BatchImportDialog` 两个类 + 账号管理 tab 新按钮
+- `version.py`：3.1.0 → 3.2.0
+
+### 注意事项
+- 批量导入的 session 会被复制到 exe 旁边的 `session_{name}.session`
+- 导入活号时代理也会一并写入 config.json，不用再手动配每个号
+- 健康检测串行跑，10 号最坏约 200 秒（每号 20s timeout）
+
 ## v3.1.0 - 防封控大修 + 关键 bug 修复 (2026-04-24)
 
 ### 🔴 关键 bug 修复（批次一）

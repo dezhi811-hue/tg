@@ -4,7 +4,7 @@ import sys
 block_cipher = None
 
 a = Analysis(
-    ['run_gui.py', 'gui_monitor.py', 'account_manager.py', 'filter.py', 'rate_limiter.py', 'remote_logger.py', 'updater.py', 'version.py'],
+    ['run_gui.py', 'gui_monitor.py', 'account_manager.py', 'filter.py', 'rate_limiter.py', 'remote_logger.py', 'updater.py', 'version.py', 'batch_import.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -16,6 +16,7 @@ a = Analysis(
         'remote_logger',
         'updater',
         'version',
+        'batch_import',
         'telethon',
         'telethon.tl',
         'telethon.tl.types',

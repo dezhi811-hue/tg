@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QTextEdit, QTabWidget,
     QGroupBox, QFormLayout, QRadioButton, QButtonGroup,
     QFileDialog, QMessageBox, QSpinBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QInputDialog, QMenu
+    QHeaderView, QInputDialog, QMenu, QDialog, QDialogButtonBox, QProgressBar
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
 from PyQt5.QtGui import QFont, QColor
@@ -1143,6 +1143,405 @@ class UpdateApplyThread(QThread):
             self.finished_signal.emit(False, str(e))
 
 
+class BatchImportThread(QThread):
+    """后台跑 批量导入号包 + 代理分配 + 首登健康检测。"""
+
+    progress_signal = pyqtSignal(int, int, str)  # done, total, msg
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(list, str)  # results, error
+
+    def __init__(self, entries, proxies, copy_sessions, parent=None):
+        """entries: [(name, session_path, json_path)], proxies: [dict]"""
+        super().__init__(parent)
+        self.entries = entries
+        self.proxies = proxies
+        self.copy_sessions = copy_sessions
+
+    def run(self):
+        try:
+            results = asyncio.run(self._run_async())
+            self.finished_signal.emit(results, "")
+        except Exception as e:
+            import traceback
+            self.log_signal.emit(f"批量导入崩溃: {traceback.format_exc()}")
+            self.finished_signal.emit([], str(e))
+
+    async def _run_async(self):
+        import shutil
+        from batch_import import parse_info_json, health_check_account
+
+        results = []
+        total = len(self.entries)
+        for idx, (name, src_session, json_path) in enumerate(self.entries):
+            self.progress_signal.emit(idx, total, f"处理 {name}")
+
+            info = parse_info_json(json_path)
+            proxy = self.proxies[idx] if idx < len(self.proxies) else None
+
+            account = {
+                'name': name,
+                'api_id': info.get('api_id') or '',
+                'api_hash': info.get('api_hash') or '',
+                'phone': info.get('phone') or '',
+            }
+            for key in ('device_model', 'system_version', 'app_version',
+                        'lang_code', 'system_lang_code'):
+                if info.get(key):
+                    account[key] = str(info[key])
+
+            # 复制 session 到标准位置 (session_{name}.session)
+            dest_session = get_session_path(name) + '.session'
+            if self.copy_sessions and os.path.abspath(src_session) != os.path.abspath(dest_session):
+                try:
+                    shutil.copy2(src_session, dest_session)
+                except Exception as e:
+                    results.append({
+                        'name': name, 'account': account, 'proxy': proxy,
+                        'status': 'unknown_error',
+                        'error': f'复制 session 失败: {e}',
+                        'phone': account.get('phone', ''),
+                        'username': '', 'user_id': 0,
+                    })
+                    continue
+
+            session_stem = get_session_path(name)
+
+            if not account['api_id'] or not account['api_hash']:
+                results.append({
+                    'name': name, 'account': account, 'proxy': proxy,
+                    'status': 'unknown_error',
+                    'error': 'json 中缺少 api_id / api_hash',
+                    'phone': account.get('phone', ''),
+                    'username': '', 'user_id': 0,
+                })
+                continue
+
+            hc = await health_check_account(account, proxy, session_stem)
+            hc['name'] = name
+            hc['account'] = account
+            hc['proxy'] = proxy
+            if not hc.get('phone'):
+                hc['phone'] = account.get('phone', '')
+            results.append(hc)
+            self.log_signal.emit(f"[{idx+1}/{total}] {name}: {hc['status']} {hc.get('error','')}")
+
+        self.progress_signal.emit(total, total, "完成")
+        return results
+
+
+class BatchImportDialog(QDialog):
+    """批量导入号包 + 代理分配对话框。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("📦 批量导入号包")
+        self.setModal(True)
+        self.resize(900, 700)
+        self.entries = []
+        self.proxies = []
+        self.results = []
+        self.thread = None
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # 号包文件夹选择
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("号包文件夹:"))
+        self.folder_input = QLineEdit()
+        self.folder_input.setPlaceholderText("选择含 .session 和 .json 的文件夹（支持子目录）")
+        folder_row.addWidget(self.folder_input, 1)
+        pick_btn = QPushButton("📂 浏览")
+        pick_btn.clicked.connect(self._pick_folder)
+        folder_row.addWidget(pick_btn)
+        scan_btn = QPushButton("🔍 扫描")
+        scan_btn.clicked.connect(self._scan)
+        folder_row.addWidget(scan_btn)
+        layout.addLayout(folder_row)
+
+        # 扫描结果显示
+        self.scan_label = QLabel("尚未扫描")
+        self.scan_label.setStyleSheet("color: #666; padding: 4px;")
+        layout.addWidget(self.scan_label)
+
+        # 代理批量粘贴
+        layout.addWidget(QLabel("代理列表（一行一条，格式 host:port:user:pass）:"))
+        self.proxy_text = QTextEdit()
+        self.proxy_text.setFont(QFont('Consolas', 10))
+        self.proxy_text.setPlaceholderText(
+            "us-eu.fluxisp.com:5000:gdggxfzrk51113-region-US-sid-FNVUBKrn-t-5:uhh5m5eu\n"
+            "另一条代理...\n"
+            "# 以 # 开头的行会被忽略"
+        )
+        self.proxy_text.setMaximumHeight(160)
+        layout.addWidget(self.proxy_text)
+        self.proxy_info = QLabel("")
+        self.proxy_info.setStyleSheet("color: #666; padding: 2px;")
+        layout.addWidget(self.proxy_info)
+        self.proxy_text.textChanged.connect(self._update_proxy_info)
+
+        # 进度 + 日志
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+        self.progress_label = QLabel("")
+        self.progress_label.setVisible(False)
+        layout.addWidget(self.progress_label)
+
+        # 结果表格
+        layout.addWidget(QLabel("结果:"))
+        self.result_table = QTableWidget()
+        self.result_table.setColumnCount(6)
+        self.result_table.setHorizontalHeaderLabels([
+            "账号名", "手机号", "代理", "状态", "错误", "可退款"
+        ])
+        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.result_table, 1)
+
+        # 按钮栏
+        btn_row = QHBoxLayout()
+        self.start_btn = QPushButton("🚀 开始检测")
+        self.start_btn.setStyleSheet("background: #4CAF50; color: white; padding: 8px;")
+        self.start_btn.clicked.connect(self._start)
+        btn_row.addWidget(self.start_btn)
+
+        self.export_btn = QPushButton("📤 导出死号 CSV")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self._export_dead)
+        btn_row.addWidget(self.export_btn)
+
+        self.import_btn = QPushButton("✅ 将活号写入 config")
+        self.import_btn.setEnabled(False)
+        self.import_btn.setStyleSheet("background: #2196F3; color: white; padding: 8px;")
+        self.import_btn.clicked.connect(self._apply_to_config)
+        btn_row.addWidget(self.import_btn)
+
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(close_btn)
+
+        layout.addLayout(btn_row)
+
+    def _pick_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择号包文件夹")
+        if folder:
+            self.folder_input.setText(folder)
+            self._scan()
+
+    def _scan(self):
+        from batch_import import scan_account_folder
+        folder = self.folder_input.text().strip()
+        if not folder:
+            QMessageBox.warning(self, "提示", "请先选择文件夹")
+            return
+        self.entries = scan_account_folder(folder)
+        with_json = sum(1 for e in self.entries if e[2])
+        if not self.entries:
+            self.scan_label.setText("❌ 未找到 .session 文件")
+            self.scan_label.setStyleSheet("color: red; padding: 4px;")
+        else:
+            self.scan_label.setText(
+                f"✅ 找到 {len(self.entries)} 个 session，其中 {with_json} 个有配套 json"
+            )
+            self.scan_label.setStyleSheet("color: green; padding: 4px;")
+
+    def _update_proxy_info(self):
+        from batch_import import parse_proxy_block
+        proxies, errors = parse_proxy_block(self.proxy_text.toPlainText())
+        text = f"已解析 {len(proxies)} 条代理"
+        if errors:
+            text += f"；{len(errors)} 行格式错误：{errors[0]}"
+        self.proxy_info.setText(text)
+        self.proxies = proxies
+
+    def _start(self):
+        from batch_import import parse_proxy_block
+        if not self.entries:
+            QMessageBox.warning(self, "提示", "请先扫描号包文件夹")
+            return
+
+        proxies, errors = parse_proxy_block(self.proxy_text.toPlainText())
+        if errors:
+            QMessageBox.critical(self, "代理格式错误", "\n".join(errors))
+            return
+
+        missing_json = [e[0] for e in self.entries if not e[2]]
+        if missing_json:
+            reply = QMessageBox.question(
+                self, "缺少 json",
+                f"{len(missing_json)} 个号没有配套 json（api_id/api_hash 需手动补），是否跳过这些号继续？\n示例：{missing_json[:3]}",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        if len(proxies) < len(self.entries):
+            reply = QMessageBox.question(
+                self, "代理数量不足",
+                f"号数 {len(self.entries)} > 代理数 {len(proxies)}，不够每号一个 IP。\n"
+                f"前 {len(proxies)} 个号用代理，其余直连。继续？",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        # P1: 检查 session 覆盖冲突
+        conflicts = []
+        for (name, src_session, _) in self.entries:
+            dest = get_session_path(name) + '.session'
+            if os.path.abspath(src_session) == os.path.abspath(dest):
+                continue
+            if os.path.exists(dest):
+                conflicts.append(name)
+        if conflicts:
+            preview = ', '.join(conflicts[:5]) + (f" 等 {len(conflicts)} 个" if len(conflicts) > 5 else '')
+            reply = QMessageBox.question(
+                self, "覆盖确认",
+                f"以下号名在本机已有 session 文件，导入会覆盖原登录态：\n{preview}\n\n继续？",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        self.start_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setMaximum(len(self.entries))
+        self.progress_label.setVisible(True)
+        self.result_table.setRowCount(0)
+        self.proxies = proxies
+
+        self.thread = BatchImportThread(self.entries, proxies, copy_sessions=True, parent=self)
+        self.thread.progress_signal.connect(self._on_progress)
+        self.thread.finished_signal.connect(self._on_finished)
+        if hasattr(self.parent(), 'log'):
+            self.thread.log_signal.connect(self.parent().log)
+        self.thread.start()
+
+    def _on_progress(self, done, total, msg):
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(done)
+        self.progress_label.setText(f"[{done}/{total}] {msg}")
+
+    def _on_finished(self, results, error):
+        self.start_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+        # P2: 清理线程引用，避免关窗口时 Qt 警告
+        if self.thread is not None:
+            try:
+                self.thread.wait(100)
+            except Exception:
+                pass
+            self.thread = None
+        if error:
+            QMessageBox.critical(self, "失败", f"批量导入失败: {error}")
+            return
+        self.results = results
+        self._fill_result_table()
+        self.export_btn.setEnabled(True)
+        self.import_btn.setEnabled(True)
+
+        alive = sum(1 for r in results if r['status'] == 'alive')
+        dead = sum(1 for r in results if r['status'].startswith('dead'))
+        proxy_bad = sum(1 for r in results if r['status'] == 'proxy_failed')
+        QMessageBox.information(
+            self, "完成",
+            f"检测完成\n活号: {alive}\n死号: {dead}\n代理/网络异常: {proxy_bad}\n其他: {len(results) - alive - dead - proxy_bad}"
+        )
+
+    def closeEvent(self, event):
+        """关窗口时若线程仍在跑，先等它退出避免 Qt 警告。"""
+        if self.thread is not None and self.thread.isRunning():
+            self.thread.wait(3000)
+        super().closeEvent(event)
+
+    def _fill_result_table(self):
+        from batch_import import STATUS_LABEL, is_refundable
+        self.result_table.setRowCount(len(self.results))
+        for i, r in enumerate(self.results):
+            proxy = r.get('proxy') or {}
+            proxy_str = f"{proxy.get('host','')}:{proxy.get('port','')}" if proxy else "(直连)"
+            items = [
+                r['name'],
+                r.get('phone') or r.get('account', {}).get('phone', ''),
+                proxy_str,
+                STATUS_LABEL.get(r['status'], r['status']),
+                r.get('error', ''),
+                "是" if is_refundable(r['status']) else "否",
+            ]
+            for col, text in enumerate(items):
+                cell = QTableWidgetItem(str(text))
+                if r['status'] == 'alive':
+                    cell.setForeground(QColor('green'))
+                elif r['status'].startswith('dead'):
+                    cell.setForeground(QColor('red'))
+                elif r['status'] == 'proxy_failed':
+                    cell.setForeground(QColor('orange'))
+                self.result_table.setItem(i, col, cell)
+
+    def _export_dead(self):
+        from batch_import import is_refundable, STATUS_LABEL
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出死号列表", f"dead_accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            "CSV (*.csv)"
+        )
+        if not path:
+            return
+        import csv
+        with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['账号名', '手机号', '状态', '错误'])
+            for r in self.results:
+                if is_refundable(r['status']):
+                    w.writerow([
+                        r['name'],
+                        r.get('phone') or r.get('account', {}).get('phone', ''),
+                        STATUS_LABEL.get(r['status'], r['status']),
+                        r.get('error', ''),
+                    ])
+        QMessageBox.information(self, "成功", f"已导出到 {path}")
+
+    def _apply_to_config(self):
+        """只把活号写入 config.json。"""
+        parent = self.parent()
+        alive_results = [r for r in self.results if r['status'] == 'alive']
+        if not alive_results:
+            QMessageBox.warning(self, "提示", "没有活号可导入")
+            return
+
+        reply = QMessageBox.question(
+            self, "确认",
+            f"将 {len(alive_results)} 个活号写入 config.json。\n"
+            f"已有同名账号会被覆盖。继续？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        existing = {a['name']: a for a in parent.config.get('accounts', [])}
+        for r in alive_results:
+            acc = dict(r['account'])
+            proxy = r.get('proxy') or {}
+            acc['proxy'] = {
+                'host': proxy.get('host', ''),
+                'port': proxy.get('port', 0),
+                'username': proxy.get('username', ''),
+                'password': proxy.get('password', ''),
+            }
+            existing[acc['name']] = acc
+
+        parent.config['accounts'] = list(existing.values())
+        save_config(parent.config)
+        parent.load_account_login_status()
+        parent.refresh_account_table()
+        parent.start_account_check()
+        parent.log(f"📦 批量导入 {len(alive_results)} 个活号到 config.json")
+        QMessageBox.information(self, "成功", f"已导入 {len(alive_results)} 个活号")
+        self.accept()
+
+
 class TelegramFilterGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1369,6 +1768,11 @@ class TelegramFilterGUI(QMainWindow):
         self.login_btn.setStyleSheet("background: #4CAF50; color: white; padding: 6px;")
         self.login_btn.clicked.connect(self.login_selected_account)
         btn_row.addWidget(self.login_btn)
+
+        self.batch_import_btn = QPushButton("📦 批量导入号包")
+        self.batch_import_btn.setStyleSheet("background: #FF9800; color: white; padding: 6px;")
+        self.batch_import_btn.clicked.connect(self.open_batch_import)
+        btn_row.addWidget(self.batch_import_btn)
 
         self.delete_btn = QPushButton("🗑️ 删除选中账号")
         self.delete_btn.setStyleSheet("background: #f44336; color: white; padding: 6px;")
@@ -2070,6 +2474,11 @@ class TelegramFilterGUI(QMainWindow):
         self.refresh_account_table()
         self.log(f"🗑️ 账号 {name} 已删除")
         QMessageBox.information(self, "成功", f"账号「{name}」已删除")
+
+    def open_batch_import(self):
+        """打开批量导入号包对话框"""
+        dialog = BatchImportDialog(self)
+        dialog.exec_()
 
     def update_account_status(self, status_dict):
         """更新账号状态（从筛选线程接收）"""
