@@ -1,18 +1,6 @@
 {
   "accounts": [
     {
-      "name": "account1",
-      "api_id": "YOUR_API_ID",
-      "api_hash": "YOUR_API_HASH",
-      "phone": "+12345678901",
-      "proxy": {
-        "host": "127.0.0.1",
-        "port": 1080,
-        "username": "",
-        "password": ""
-      }
-    },
-    {
       "name": "account2",
       "api_id": "YOUR_API_ID",
       "api_hash": "YOUR_API_HASH",
@@ -30,5 +18,26 @@
     "min_delay": 20,
     "max_delay": 30,
     "error_cooldown": 900
+  },
+  "pool_config": {
+    "max_concurrency": null,
+    "warmup_hours": 72,
+    "floodwait_retire_threshold": 3,
+    "floodwait_window_hours": 24,
+    "floodwait_retire_seconds": 300,
+    "cooling_min_minutes": 20,
+    "cooling_max_minutes": 60,
+    "empty_probe_threshold": 30,
+    "decoy_call_interval": 12,
+    "force_daily_contacts_reset": true,
+    "tdata_health_bonus": 10,
+    "dc1_lock": false,
+    "check_cache_hours": 24,
+    "pacing": {
+      "burst_min": 2, "burst_max": 4,
+      "burst_interval_min": 8, "burst_interval_max": 18,
+      "quiet_interval_min": 180, "quiet_interval_max": 600,
+      "quiet_hour_multiplier": 3.0
+    }
   }
 }

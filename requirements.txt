@@ -2,3 +2,5 @@ telethon==1.36.0
 python-dotenv==1.0.0
 aiofiles==23.2.1
 pandas==2.2.0
+pytz>=2024.1
+opentele>=1.15.0

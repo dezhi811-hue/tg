@@ -6,6 +6,7 @@ import os
 import sys
 import asyncio
 import random
+import zlib
 from datetime import datetime, timedelta
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
@@ -29,9 +30,10 @@ def resolve_device_profile(account):
     优先读 account 中的显式字段；缺失则按账号 name 的稳定 hash 从指纹池挑一套，
     保证同一账号每次启动得到相同指纹，避免 Telegram 风控误判为"设备频繁切换"。
     """
-    # 稳定 hash：name 相同永远得到同一套指纹
+    # 必须用 crc32 / md5 等跨进程稳定的哈希，Python 内置 hash(str) 带 PYTHONHASHSEED
+    # 随机种子，每次启动结果不同 → 会让同一个 session 每次重开软件指纹都变。
     name = account.get('name') or ''
-    idx = abs(hash(name)) % len(_DEVICE_PROFILES)
+    idx = zlib.crc32(name.encode('utf-8')) % len(_DEVICE_PROFILES)
     profile = _DEVICE_PROFILES[idx]
     return {
         'device_model': account.get('device_model') or profile['device_model'],
@@ -96,6 +98,12 @@ class AccountManager:
                 'is_blocked': False,
                 'block_until': None
             }
+            # 透传设备指纹字段：批量导入号包时从 json 解析到 config 里的指纹必须沿用，
+            # 否则同一 session 在首登和筛号时指纹漂移，TG 静默降权导致连续空返回。
+            for fp_key in ('device_model', 'system_version', 'app_version',
+                           'lang_code', 'system_lang_code'):
+                if acc_config.get(fp_key):
+                    account[fp_key] = acc_config[fp_key]
             self.accounts.append(account)
             self.account_stats[acc_config['name']] = {
                 'total_requests': 0,
@@ -210,11 +218,30 @@ class AccountManager:
         """连接所有账号"""
         print(f"🔗 正在连接 {len(self.accounts)} 个账号...")
 
+        # §5.14 美国号池 → 全部直连 DC1 (MIA)，不经 DC2 redirect
+        # 池全是 +1 美国号，锁 DC1 可避免代理 IP 先暴露给 DC2、少一次握手
+        dc1_lock = bool(self.config.get('pool_config', {}).get('dc1_lock', False))
+        DC1_MIA = (1, '149.154.175.50', 443)
+
         for account in self.accounts:
             try:
-                proxy_config = build_proxy_config(account.get('proxy'))
+                raw_proxy = account.get('proxy') or {}
+                # §5.7 Sticky Session 强制：动态代理 user 字段若没带 -session-xxx，
+                # 按号名 crc32 自动注入稳定 session id。同一号每次启动拿到同一出口 IP，
+                # 避免 TG 看到"同一账号秒换设备"。
+                # build_sticky_proxy_user 已做幂等检查，已有 sid 的直接透传。
+                if raw_proxy.get('host'):
+                    try:
+                        from account_pool import build_sticky_proxy_for
+                        raw_proxy = build_sticky_proxy_for(account, raw_proxy)
+                    except Exception:
+                        pass
+                proxy_config = build_proxy_config(raw_proxy)
                 if proxy_config:
-                    print(f"  {account['name']} 使用代理: {proxy_config[1]}:{proxy_config[2]}")
+                    # 脱敏打印：只显示前 12 字符的 user 字段
+                    uname = (proxy_config[4] or '')
+                    masked = (uname[:12] + '...') if len(uname) > 12 else uname
+                    print(f"  {account['name']} 使用代理: {proxy_config[1]}:{proxy_config[2]} user={masked}")
                 else:
                     print(f"  ⚠️  {account['name']} 未配置代理，直连 Telegram")
 
@@ -227,6 +254,16 @@ class AccountManager:
                     proxy=proxy_config,
                     **fp,
                 )
+                if dc1_lock:
+                    # 只对新 session 生效：已登录 session 的 DC 在 .session 文件里，
+                    # 改 DC 会让 auth_key 与服务端对不上，静默登出。
+                    session_file = _get_session_path(account['name']) + '.session'
+                    if not os.path.exists(session_file):
+                        try:
+                            client.session.set_dc(*DC1_MIA)
+                            print(f"  🗽 {account['name']} DC1 direct (MIA, 首登)")
+                        except Exception as de:
+                            print(f"  ⚠️  {account['name']} DC1 锁失败: {de}")
                 await client.connect()
 
                 if not await client.is_user_authorized():

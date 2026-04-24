@@ -53,12 +53,48 @@ def parse_proxy_block(text):
     return proxies, errors
 
 
-def scan_account_folder(folder):
-    """扫描目录返回 [(name, session_path, json_path_or_None), ...]。
+def _find_tdata(dir_path):
+    """识别 tdata 子目录（Telegram Desktop 官方登录态目录）。"""
+    tdata_subdir = os.path.join(dir_path, 'tdata')
+    if not os.path.isdir(tdata_subdir):
+        return None
+    # tdata 目录必有 key_datas 或 D877F783D5D3EF8C_* 之类文件
+    try:
+        files = os.listdir(tdata_subdir)
+    except OSError:
+        return None
+    for f in files:
+        if f.startswith('key_datas') or 'D877F783D5D3EF8C' in f:
+            return tdata_subdir
+    return None
 
+
+async def convert_tdata_to_telethon(tdata_dir, out_session_path, api_id=None, api_hash=None):
+    """tdata → .session（§5.13）。保留 opentele 的官方指纹，可信度显著高于 session。
+
+    要求：pip install opentele
+    """
+    from opentele.td import TDesktop
+    from opentele.api import UseCurrentSession, API
+    tdesk = TDesktop(tdata_dir)
+    if not tdesk.isLoaded():
+        raise RuntimeError('tdata 加载失败（key_datas 损坏或密码保护）')
+    api = API.TelegramDesktop.Generate() if not api_id else None
+    client = await tdesk.ToTelethon(
+        session=out_session_path,
+        flag=UseCurrentSession,
+        api=api,
+    )
+    return client
+
+
+def scan_account_folder(folder):
+    """扫描目录返回 [(name, session_path_or_tdata, json_path_or_None, source_type), ...]。
+
+    source_type ∈ {'session', 'tdata'}。同一号同时有 tdata 和 .session 时优先 tdata。
     支持两种布局：
     1. 扁平：folder/{name}.session + folder/{name}.json (或 info.json)
-    2. 子目录：folder/{name}/*.session + folder/{name}/info.json
+    2. 子目录：folder/{name}/*.session 或 folder/{name}/tdata/ + folder/{name}/info.json
     """
     found = []
     if not folder or not os.path.isdir(folder):
@@ -69,6 +105,19 @@ def scan_account_folder(folder):
             entries = os.listdir(dir_path)
         except OSError:
             return
+        # 优先识别 tdata
+        tdata_path = _find_tdata(dir_path)
+        if tdata_path and base_name:
+            jp = next(
+                (p for p in (
+                    os.path.join(dir_path, base_name + '.json'),
+                    os.path.join(dir_path, 'info.json'),
+                    os.path.join(dir_path, base_name + '_info.json'),
+                ) if os.path.exists(p)),
+                None,
+            )
+            found.append((base_name, tdata_path, jp, 'tdata'))
+            return  # 同一号不再扫 session
         sessions = [f for f in entries if f.lower().endswith(SESSION_EXT)]
         for s in sessions:
             sp = os.path.join(dir_path, s)
@@ -81,7 +130,7 @@ def scan_account_folder(folder):
             ]
             jp = next((j for j in json_candidates if os.path.exists(j)), None)
             name = base_name if base_name else stem
-            found.append((name, sp, jp))
+            found.append((name, sp, jp, 'session'))
 
     _pair_in_dir(folder)
     for sub in os.listdir(folder):
@@ -89,14 +138,17 @@ def scan_account_folder(folder):
         if os.path.isdir(sp):
             _pair_in_dir(sp, base_name=sub)
 
-    # 去重（扁平+子目录可能重复），以 session 绝对路径为键
-    seen, uniq = set(), []
+    # 去重（扁平+子目录可能重复），以 name 为键，tdata 优先
+    by_name = {}
     for entry in found:
-        key = os.path.abspath(entry[1])
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append(entry)
+        name = entry[0]
+        existing = by_name.get(name)
+        if existing is None or (existing[3] == 'session' and entry[3] == 'tdata'):
+            by_name[name] = entry
+    uniq = list(by_name.values())
+    # 按账号名字典序固定顺序：保证 UI 第 N 行 = 粘贴代理的第 N 行，
+    # 不被 os.listdir 的平台相关顺序坑（Win / macOS / Linux 各不同）。
+    uniq.sort(key=lambda e: e[0])
     return uniq
 
 
@@ -142,7 +194,21 @@ async def health_check_account(account, proxy_dict, session_path, timeout=20):
     from account_manager import resolve_device_profile, build_proxy_config
 
     fp = resolve_device_profile(account)
-    proxy = build_proxy_config(proxy_dict)
+    # 把首登实际使用的指纹回写到 account，上层会把它落盘到 config.json，
+    # 确保后续筛号用完全相同的 device_model/system_version/... 再登 Telegram。
+    # 没有这一步的话，没 json 的号会走 hash fallback 拿到指纹做首登，但保存时不带，
+    # 下次启动只要账号列表变动导致 hash 命中的槽位变化，指纹就漂移。
+    for k, v in fp.items():
+        account.setdefault(k, v)
+    # §5.7 首登也走 sticky，避免 "首登 IP-A / 筛号 IP-B" 的指纹错位
+    sticky_proxy = proxy_dict
+    if proxy_dict and proxy_dict.get('host'):
+        try:
+            from account_pool import build_sticky_proxy_for
+            sticky_proxy = build_sticky_proxy_for(account, proxy_dict)
+        except Exception:
+            sticky_proxy = proxy_dict
+    proxy = build_proxy_config(sticky_proxy)
 
     result = {
         'status': 'unknown_error', 'error': '',

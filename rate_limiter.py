@@ -31,15 +31,14 @@ class RateLimiter:
             if time_since_error < self.config['error_cooldown']:
                 extra_delay = random.uniform(5, 15)
                 base_delay += extra_delay
-                print(f"⏳ 最近有错误，增加延迟 {extra_delay:.1f}秒")
 
         # 如果错误次数过多，进一步增加延迟
         if self.error_count > 3:
             penalty = self.error_count * random.uniform(2, 5)
             base_delay += penalty
-            print(f"⚠️  错误次数较多，额外延迟 {penalty:.1f}秒")
 
-        print(f"⏱️  等待 {base_delay:.1f}秒...")
+        # 打印到 stdout 在 PyInstaller windowed 模式下 stdout 可能为 None 导致异常，
+        # GUI 模式下这些进度也没人看，留给 filter_thread 的 log_signal 来呈现。
         await asyncio.sleep(base_delay)
 
         # 记录请求时间

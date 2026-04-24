@@ -35,7 +35,15 @@ async def main():
     acc = accounts[0]
     session_name = f"session_{acc['name']}"
 
-    proxy_config = build_proxy_config(acc.get('proxy'))
+    raw_proxy = acc.get('proxy') or {}
+    # §5.7 登录也走 sticky，与后续 connect_all / health_check 使用同一出口 IP
+    if raw_proxy.get('host'):
+        try:
+            from account_pool import build_sticky_proxy_for
+            raw_proxy = build_sticky_proxy_for(acc, raw_proxy)
+        except Exception:
+            pass
+    proxy_config = build_proxy_config(raw_proxy)
     if proxy_config:
         print(f"  使用代理: {proxy_config[1]}:{proxy_config[2]}")
 

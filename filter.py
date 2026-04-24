@@ -10,13 +10,24 @@ from telethon.tl.functions.contacts import (
     ResetSavedRequest,
     ResolvePhoneRequest,
 )
-from telethon.tl.functions.messages import GetDialogsRequest
+from telethon.tl.functions.messages import GetDialogsRequest, GetHistoryRequest
+from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.functions.account import UpdateStatusRequest
 from telethon.tl.types import InputPhoneContact, InputPeerEmpty
 from telethon.errors import (
     PhoneNumberInvalidError,
     FloodWaitError,
 )
 from phone_utils import PhoneUtils
+
+try:
+    from account_pool import PERMANENT_LIMIT_CODES
+except ImportError:
+    PERMANENT_LIMIT_CODES = (
+        'PEER_FLOOD', 'SPAM_WAIT', 'USER_PRIVACY_RESTRICTED',
+        'USER_DEACTIVATED', 'USER_DEACTIVATED_BAN',
+        'AUTH_KEY_UNREGISTERED', 'SESSION_REVOKED',
+    )
 
 
 # 用于 InputPhoneContact.first_name 随机化的常见英文名池，避免所有请求都用 'User'
@@ -32,9 +43,12 @@ class EmptyQueryResultError(Exception):
 
 
 class TelegramFilter:
-    def __init__(self, manager=None, limiter=None, config=None):
+    def __init__(self, manager=None, limiter=None, config=None, pool=None, pacer=None):
         self.manager = manager
         self.limiter = limiter
+        # 号池 & 新节奏器（M3/M5）。若提供则优先使用。
+        self.pool = pool
+        self.pacer = pacer
         # 从 config['rate_limit'] 读取防封控开关，默认保守值
         rl = (config or {}).get('rate_limit', {}) if isinstance(config, dict) else {}
         # use_resolve_phone: true 时走 ResolvePhoneRequest（不入联系人簿，配额松）
@@ -100,8 +114,18 @@ class TelegramFilter:
         try:
             account = self.manager.get_next_account()
 
-            await self.limiter.wait_before_request()
+            # 节奏：池子存在则走新 pacer（burst-silent + 日配额感知），
+            # 否则 fallback 老 limiter。
+            if self.pacer is not None:
+                await self.pacer.wait(account['name'])
+            elif self.limiter is not None:
+                await self.limiter.wait_before_request()
             client = account['client']
+
+            # §5.3 API 多样化：每 N 次真筛号插一次伪装调用
+            if self.pool is not None and self.pool.needs_decoy_call(account['name']):
+                await self._do_decoy_call(client, account['name'])
+
             contact = await self._import_contact_and_get_user(client, result['phone'])
 
             result['registered'] = True
@@ -117,16 +141,25 @@ class TelegramFilter:
 
             self.manager.mark_account_used(account)
             self.manager.mark_account_success(account)
+            if self.pool is not None:
+                api = 'ResolvePhoneRequest' if self.use_resolve_phone else 'ImportContactsRequest'
+                self.pool.record_request(account['name'], success=True, api_name=api)
             # 命中也穿插静默读与周期清理联系人簿
             await self._maybe_silent_read(client, account)
             await self._maybe_reset_contacts(client, account)
 
         except FloodWaitError as e:
             if account:
+                # FloodWait 本身就是"请求已送达 TG 且被限速"，必须计数，
+                # 否则 request_count 永远涨不到 requests_per_account，单号冷却永远不触发
+                self.manager.mark_account_used(account)
                 self.manager.mark_account_error(account, e)
+                if self.pool is not None:
+                    self.pool.record_floodwait(account['name'], e.seconds)
             result['query_state'] = 'rate_limited'
             result['error'] = f'触发速率限制，需等待{e.seconds}秒'
         except PhoneNumberInvalidError:
+            # 号码格式错误，未真正触达 TG，不记 used
             result['query_state'] = 'invalid'
             result['error'] = '手机号格式无效'
         except EmptyQueryResultError:
@@ -134,15 +167,49 @@ class TelegramFilter:
             # 调度器不会触发单号冷却，会变成死循环猛薅一个已经坏了的号。
             if account:
                 self.manager.mark_account_used(account)
+                if self.pool is not None:
+                    api = 'ResolvePhoneRequest' if self.use_resolve_phone else 'ImportContactsRequest'
+                    self.pool.record_request(account['name'], success=False, api_name=api)
+                    self.pool.record_empty_return(account['name'])
             result['query_state'] = 'empty_result'
             result['error'] = '查询未返回用户'
         except Exception as e:
+            # §5.12 PEER_FLOOD / SPAM_WAIT 等永久限制：立即退役，不走累计
+            msg = str(e).upper()
+            matched_code = next((c for c in PERMANENT_LIMIT_CODES if c in msg), None)
             if account:
+                self.manager.mark_account_used(account)
                 self.manager.mark_account_error(account)
-            result['query_state'] = 'query_failed'
+                if self.pool is not None:
+                    if matched_code:
+                        self.pool.record_permanent_limit(account['name'], matched_code)
+                    else:
+                        self.pool.record_request(account['name'], success=False)
+            result['query_state'] = 'permanent_limit' if matched_code else 'query_failed'
             result['error'] = str(e)
 
         return result
+
+    async def _do_decoy_call(self, client, account_name):
+        """§5.3 伪装调用：改变该号 API 分布，避免 100% ImportContacts。结果丢弃。"""
+        try:
+            choice = random.choice(['dialogs', 'full_user', 'status'])
+            if choice == 'dialogs':
+                await client(GetDialogsRequest(
+                    offset_date=None, offset_id=0,
+                    offset_peer=InputPeerEmpty(), limit=5, hash=0,
+                ))
+                api = 'GetDialogsRequest'
+            elif choice == 'full_user':
+                await client(GetFullUserRequest('me'))
+                api = 'GetFullUserRequest'
+            else:
+                await client(UpdateStatusRequest(offline=False))
+                api = 'UpdateStatusRequest'
+            if self.pool is not None:
+                self.pool.record_request(account_name, success=True, api_name=api)
+        except Exception:
+            pass
 
     async def _import_contact_and_get_user(self, client, phone):
         """根据配置选择 ResolvePhone 或 ImportContacts。
@@ -206,7 +273,18 @@ class TelegramFilter:
             pass  # 静默读失败不影响筛号主流程
 
     async def _maybe_reset_contacts(self, client, account):
-        """周期性清空联系人簿，兜底 DeleteContactsRequest 未及时清理的遗留。"""
+        """周期性清空联系人簿，兜底 DeleteContactsRequest 未及时清理的遗留。
+
+        §5.10：号池启用时每日强制至少一次 ResetSavedRequest。
+        """
+        # §5.10 每日强制清一次（池子模式下）
+        if self.pool is not None and self.pool.needs_daily_contacts_reset(account['name']):
+            try:
+                await client(ResetSavedRequest())
+                self.pool.record_contacts_reset(account['name'])
+                return
+            except Exception:
+                pass
         if self.reset_contacts_interval <= 0:
             return
         count = account.get('request_count', 0)
@@ -214,6 +292,8 @@ class TelegramFilter:
             return
         try:
             await client(ResetSavedRequest())
+            if self.pool is not None:
+                self.pool.record_contacts_reset(account['name'])
         except Exception:
             pass
 

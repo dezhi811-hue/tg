@@ -105,7 +105,15 @@ def load_config():
                 return json.load(f)
         except:
             pass
-    return {"accounts": [], "rate_limit": {"requests_per_account": 50, "min_delay": 20, "max_delay": 30, "error_cooldown": 900}}
+    # 默认速率偏保守：25–45s/号 + 单号 50 次上限 + 空返阈值 30
+    # 2026 TG 风控下，15–20s 的老默认值对新号太快，容易触发静默限速
+    return {"accounts": [], "rate_limit": {
+        "requests_per_account": 50,
+        "min_delay": 25,
+        "max_delay": 45,
+        "error_cooldown": 900,
+        "empty_probe_threshold": 30,
+    }}
 
 def save_config(config):
     """保存配置文件，带备份机制"""
@@ -172,7 +180,14 @@ class LoginThread(QThread):
         from telethon.errors import SessionPasswordNeededError
         from account_manager import resolve_device_profile, build_proxy_config
 
-        proxy_config = build_proxy_config(self.account.get('proxy'))
+        raw_proxy = self.account.get('proxy') or {}
+        if raw_proxy.get('host'):
+            try:
+                from account_pool import build_sticky_proxy_for
+                raw_proxy = build_sticky_proxy_for(self.account, raw_proxy)
+            except Exception:
+                pass
+        proxy_config = build_proxy_config(raw_proxy)
         fp = resolve_device_profile(self.account)
 
         client = TelegramClient(
@@ -270,7 +285,14 @@ class AccountCheckThread(QThread):
         }
 
         try:
-            proxy_config = build_proxy_config(account.get('proxy'))
+            raw_proxy = account.get('proxy') or {}
+            if raw_proxy.get('host'):
+                try:
+                    from account_pool import build_sticky_proxy_for
+                    raw_proxy = build_sticky_proxy_for(account, raw_proxy)
+                except Exception:
+                    pass
+            proxy_config = build_proxy_config(raw_proxy)
             fp = resolve_device_profile(account)
             if proxy_config:
                 proxy_client = None
@@ -380,7 +402,7 @@ class FilterThread(QThread):
     PROGRESS_FILE = 'filter_progress.json'
     MAX_RETRIES = 3
     PROBE_FAILURE_THRESHOLD = 2
-    CONSECUTIVE_EMPTY_TRIGGER = 15  # 单账号连续空返回达此阈值 → 触发定向探针确诊
+    CONSECUTIVE_EMPTY_TRIGGER = 30  # 单账号连续空返回达此阈值 → 触发定向探针确诊
     EMPTY_PROBE_COOLDOWN_SEC = 600  # 空返探针未命中/复验失败的冷却时长（10 分钟）
     RECENT_SECTION_TITLE = '近期在线'
     MID_SECTION_TITLE = '一个月到半年在线'
@@ -402,6 +424,14 @@ class FilterThread(QThread):
         self.running = True
         self.probe_interval = probe_interval  # 每隔多少个号查一次探针
         self.probe_phones = probe_phones or []  # 探针号码列表
+        # 允许 config 覆盖：低命中率号包需要把阈值调高，否则 15 个连续未注册就会误触发探针
+        rl = config.get('rate_limit', {}) if isinstance(config, dict) else {}
+        try:
+            self.consecutive_empty_trigger = int(rl.get('empty_probe_threshold', self.CONSECUTIVE_EMPTY_TRIGGER))
+        except (TypeError, ValueError):
+            self.consecutive_empty_trigger = self.CONSECUTIVE_EMPTY_TRIGGER
+        if self.consecutive_empty_trigger < 5:
+            self.consecutive_empty_trigger = 5
 
     def run(self):
         """在后台运行筛选任务"""
@@ -708,14 +738,14 @@ class FilterThread(QThread):
             acc['block_count'] = acc.get('block_count', 0) + 1
             worker['needs_recheck_probe'] = True
             self.log_signal.emit(
-                f"  🧊 {acc_name} 连续 {self.CONSECUTIVE_EMPTY_TRIGGER} 次空返回（未配探针号，保守冷却 {cooldown//60} 分钟）"
+                f"  🧊 {acc_name} 连续 {self.consecutive_empty_trigger} 次空返回（未配探针号，保守冷却 {cooldown//60} 分钟）"
             )
             return
 
         probe_phone = self.probe_phones[0]
         acc['probe_count'] = acc.get('probe_count', 0) + 1
         self.log_signal.emit(
-            f"  🔍 {acc_name} 连续 {self.CONSECUTIVE_EMPTY_TRIGGER} 次空返回，触发定向探针 → {probe_phone}"
+            f"  🔍 {acc_name} 连续 {self.consecutive_empty_trigger} 次空返回，触发定向探针 → {probe_phone}"
         )
         try:
             probe_result = await self.query_with_account(
@@ -777,6 +807,20 @@ class FilterThread(QThread):
         from account_manager import AccountManager
         from filter import TelegramFilter
         from rate_limiter import RateLimiter
+        # M1/M5 号池 + 节奏器（整个筛选共用一个实例，存活到本轮结束）
+        try:
+            from account_pool import AccountPool
+            from pacing import BurstSilentPacer
+            pool = AccountPool(config_path)
+            pacer = BurstSilentPacer(pool)
+            summary = pool.summary()
+            self.log_signal.emit(
+                f"🏊 号池 active={summary['active']} warmup={summary['warmup']} "
+                f"cooling={summary['cooling']} retired={summary['retired']} 推荐并发 K={summary['concurrency_k']}"
+            )
+        except Exception as e:
+            pool, pacer = None, None
+            self.log_signal.emit(f"⚠️ 号池初始化失败，退回老调度: {e}")
 
         manager = None
         try:
@@ -788,6 +832,33 @@ class FilterThread(QThread):
             active_primary = manager.get_active_primary_accounts()
             # 严格按配置并发数执行：只保留真正连接上的号
             connected_primary = [a for a in active_primary if a.get('client')]
+
+            # M3：号池存在时优先用 pool.get_active_batch 过滤，排除 retired/cooling/warmup/达配额号
+            if pool is not None:
+                # 先把当前实际代理绑到 pool（§5.6 provider 指纹 + §5.9 子网多样性依赖）
+                for a in connected_primary:
+                    try:
+                        _changed, _sev, _msg = pool.bind_proxy(a['name'], a.get('proxy') or {})
+                        if _sev == 'red':
+                            self.log_signal.emit(
+                                f"🛑 {a['name']} 代理重大变更：{_msg}（可能触发风控）"
+                            )
+                        elif _sev == 'yellow':
+                            self.log_signal.emit(
+                                f"⚠️ {a['name']} 代理供应商变了：{_msg}"
+                            )
+                    except Exception as be:
+                        self.log_signal.emit(f"⚠️ {a['name']} 代理绑定异常: {be}")
+                allowed = set(pool.get_active_batch())
+                before = len(connected_primary)
+                filtered = [a for a in connected_primary if a['name'] in allowed]
+                if filtered:
+                    self.log_signal.emit(
+                        f"🏊 从池中挑 {len(filtered)} 个（原 {before}，过滤掉 cooling/retired/warmup/达配额）"
+                    )
+                    connected_primary = filtered
+                else:
+                    self.log_signal.emit("⚠️ 号池过滤后没有可用号，本轮走原 primary 列表")
             target_concurrency = len(active_primary)
             real_concurrency = len(connected_primary)
             if not connected_primary:
@@ -805,7 +876,7 @@ class FilterThread(QThread):
             workers = []
             for account in active_primary:
                 limiter = RateLimiter(self.config['rate_limit'])
-                filter_obj = TelegramFilter(manager, limiter, self.config)
+                filter_obj = TelegramFilter(manager, limiter, self.config, pool=pool, pacer=pacer)
                 # 把 filter 的 manager 固定到本 worker 的账号，避免所有 worker 都
                 # 走 manager.get_next_account() 挤到同一个账号上
                 filter_obj.manager = _PinnedAccountManager(manager, account)
@@ -863,7 +934,7 @@ class FilterThread(QThread):
                     self.log_signal.emit(f"  ⚠️ 升级备用号失败: {e}")
                     return None
                 new_limiter = RateLimiter(self.config['rate_limit'])
-                new_filter = TelegramFilter(manager, new_limiter, self.config)
+                new_filter = TelegramFilter(manager, new_limiter, self.config, pool=pool, pacer=pacer)
                 new_filter.manager = _PinnedAccountManager(manager, backup)
                 new_worker = {
                     'account': backup,
@@ -884,6 +955,20 @@ class FilterThread(QThread):
             async def worker_loop(worker):
                 while self.running:
                     acc = worker['account']
+                    # M2/M3：号池已把该号标 retired → worker 直接退出，避免死循环猛薅
+                    if pool is not None:
+                        pentry = pool.get_entry(acc['name'])
+                        if pentry and pentry['state'] == 'retired':
+                            self.log_signal.emit(
+                                f"  ⚰️ {acc['name']} 已被号池退役（{pentry.get('retired_reason','')}），worker 退出"
+                            )
+                            try:
+                                manager.pause_account(acc, reason=f"pool_retired:{pentry.get('retired_reason','')}")
+                            except Exception:
+                                pass
+                            # 尝试把备用号顶上
+                            promote_backup(acc, f"pool_retired:{pentry.get('retired_reason','')}")
+                            return
                     if acc.get('is_blocked'):
                         block_until = acc.get('block_until')
                         if block_until and datetime.now() < block_until:
@@ -953,7 +1038,7 @@ class FilterThread(QThread):
                             else:
                                 worker['consecutive_empty'] = worker.get('consecutive_empty', 0) + 1
                         # 达到阈值 → 触发定向探针确诊是否 D（账号被限）
-                        if worker.get('consecutive_empty', 0) >= self.CONSECUTIVE_EMPTY_TRIGGER:
+                        if worker.get('consecutive_empty', 0) >= self.consecutive_empty_trigger:
                             worker['consecutive_empty'] = 0
                             await self._trigger_on_demand_probe(worker, manager)
                         self.status_signal.emit(self.get_account_status(manager))
@@ -1172,7 +1257,11 @@ class BatchImportThread(QThread):
 
         results = []
         total = len(self.entries)
-        for idx, (name, src_session, json_path) in enumerate(self.entries):
+        for idx, entry in enumerate(self.entries):
+            name = entry[0]
+            src_session = entry[1]
+            json_path = entry[2]
+            source_type = entry[3] if len(entry) > 3 else 'session'
             self.progress_signal.emit(idx, total, f"处理 {name}")
 
             info = parse_info_json(json_path)
@@ -1183,15 +1272,40 @@ class BatchImportThread(QThread):
                 'api_id': info.get('api_id') or '',
                 'api_hash': info.get('api_hash') or '',
                 'phone': info.get('phone') or '',
+                'source_type': source_type,
             }
             for key in ('device_model', 'system_version', 'app_version',
                         'lang_code', 'system_lang_code'):
                 if info.get(key):
                     account[key] = str(info[key])
 
-            # 复制 session 到标准位置 (session_{name}.session)
+            # §5.13 tdata 优先：先转成 Telethon session，再进健康检测
             dest_session = get_session_path(name) + '.session'
-            if self.copy_sessions and os.path.abspath(src_session) != os.path.abspath(dest_session):
+            session_stem = get_session_path(name)
+            if source_type == 'tdata':
+                try:
+                    from batch_import import convert_tdata_to_telethon
+                    # tdata 转换会自动落 .session 文件并登录一次
+                    client = await convert_tdata_to_telethon(
+                        src_session,  # 这里其实是 tdata 目录
+                        session_stem,
+                        api_id=account['api_id'] or None,
+                        api_hash=account['api_hash'] or None,
+                    )
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    results.append({
+                        'name': name, 'account': account, 'proxy': proxy,
+                        'status': 'unknown_error',
+                        'error': f'tdata 转换失败: {e}',
+                        'phone': account.get('phone', ''),
+                        'username': '', 'user_id': 0,
+                    })
+                    continue
+            elif self.copy_sessions and os.path.abspath(src_session) != os.path.abspath(dest_session):
                 try:
                     shutil.copy2(src_session, dest_session)
                 except Exception as e:
@@ -1203,8 +1317,6 @@ class BatchImportThread(QThread):
                         'username': '', 'user_id': 0,
                     })
                     continue
-
-            session_stem = get_session_path(name)
 
             if not account['api_id'] or not account['api_hash']:
                 results.append({
@@ -1223,7 +1335,7 @@ class BatchImportThread(QThread):
             if not hc.get('phone'):
                 hc['phone'] = account.get('phone', '')
             results.append(hc)
-            self.log_signal.emit(f"[{idx+1}/{total}] {name}: {hc['status']} {hc.get('error','')}")
+            self.log_signal.emit(f"[{idx+1}/{total}] {name}[{source_type}]: {hc['status']} {hc.get('error','')}")
 
         self.progress_signal.emit(total, total, "完成")
         return results
@@ -1337,12 +1449,14 @@ class BatchImportDialog(QDialog):
             return
         self.entries = scan_account_folder(folder)
         with_json = sum(1 for e in self.entries if e[2])
+        tdata_count = sum(1 for e in self.entries if len(e) > 3 and e[3] == 'tdata')
         if not self.entries:
-            self.scan_label.setText("❌ 未找到 .session 文件")
+            self.scan_label.setText("❌ 未找到 .session 或 tdata 目录")
             self.scan_label.setStyleSheet("color: red; padding: 4px;")
         else:
+            extra = f"，{tdata_count} 个 tdata（健康分 +10）" if tdata_count else ""
             self.scan_label.setText(
-                f"✅ 找到 {len(self.entries)} 个 session，其中 {with_json} 个有配套 json"
+                f"✅ 找到 {len(self.entries)} 个号，其中 {with_json} 个有 json{extra}"
             )
             self.scan_label.setStyleSheet("color: green; padding: 4px;")
 
@@ -1386,9 +1500,14 @@ class BatchImportDialog(QDialog):
             if reply != QMessageBox.Yes:
                 return
 
-        # P1: 检查 session 覆盖冲突
+        # P1: 检查 session 覆盖冲突（tdata 源不走 copy，所以只检查 session 源）
         conflicts = []
-        for (name, src_session, _) in self.entries:
+        for entry in self.entries:
+            name = entry[0]
+            src_session = entry[1]
+            source_type = entry[3] if len(entry) > 3 else 'session'
+            if source_type == 'tdata':
+                continue
             dest = get_session_path(name) + '.session'
             if os.path.abspath(src_session) == os.path.abspath(dest):
                 continue
@@ -1403,6 +1522,31 @@ class BatchImportDialog(QDialog):
             )
             if reply != QMessageBox.Yes:
                 return
+
+        # P3: 号↔代理映射确认（位置对应，号顺序按名字典序，UI 上看到什么就是什么）
+        mapping_lines = []
+        for idx, entry in enumerate(self.entries):
+            name = entry[0]
+            source_type = entry[3] if len(entry) > 3 else 'session'
+            src_tag = '[tdata]' if source_type == 'tdata' else '[session]'
+            if idx < len(proxies):
+                p = proxies[idx]
+                proxy_desc = f"{p['host']}:{p['port']}"
+            else:
+                proxy_desc = "(直连 - 无代理)"
+            mapping_lines.append(f"  {idx+1:3d}. {name:26s} {src_tag:9s} → {proxy_desc}")
+        mapping_preview = '\n'.join(mapping_lines[:20])
+        if len(mapping_lines) > 20:
+            mapping_preview += f"\n  ... 还有 {len(mapping_lines) - 20} 个"
+        reply = QMessageBox.question(
+            self, "号↔代理 映射确认",
+            f"即将按以下映射执行首登检测（号已按名字典序排列）:\n\n"
+            f"{mapping_preview}\n\n"
+            f"代理错配会直接导致封号，请核对无误再继续。",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
 
         self.start_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
@@ -1533,11 +1677,15 @@ class BatchImportDialog(QDialog):
             existing[acc['name']] = acc
 
         parent.config['accounts'] = list(existing.values())
+        # 批量导入后自动把新号加入"工作号"名额，否则之前设过 primary_count=1 的用户，
+        # 导入 5 个号只有 1 个上场，剩下 4 个一直待命。
+        parent.config['primary_count'] = len(parent.config['accounts'])
         save_config(parent.config)
         parent.load_account_login_status()
         parent.refresh_account_table()
-        parent.start_account_check()
-        parent.log(f"📦 批量导入 {len(alive_results)} 个活号到 config.json")
+        # 不再在这里自动 start_account_check：health check 刚刚连过一次，再 check 等于
+        # 同一个号短时间内再做 2 次冷连接，徒增 TG 风控打分。用户若需验证可手动刷新。
+        parent.log(f"📦 批量导入 {len(alive_results)} 个活号到 config.json（primary_count={len(parent.config['accounts'])}）")
         QMessageBox.information(self, "成功", f"已导入 {len(alive_results)} 个活号")
         self.accept()
 
@@ -1876,15 +2024,25 @@ class TelegramFilterGUI(QMainWindow):
 
         self.min_spin = QSpinBox()
         self.min_spin.setRange(1, 60)
-        self.min_spin.setValue(self.config['rate_limit']['min_delay'])
+        self.min_spin.setValue(self.config['rate_limit'].get('min_delay', 25))
         self.min_spin.setFont(QFont('Arial', 11))
         form.addRow("最小延迟(秒):", self.min_spin)
 
         self.max_spin = QSpinBox()
         self.max_spin.setRange(5, 120)
-        self.max_spin.setValue(self.config['rate_limit']['max_delay'])
+        self.max_spin.setValue(self.config['rate_limit'].get('max_delay', 45))
         self.max_spin.setFont(QFont('Arial', 11))
         form.addRow("最大延迟(秒):", self.max_spin)
+
+        self.empty_threshold_spin = QSpinBox()
+        self.empty_threshold_spin.setRange(5, 200)
+        self.empty_threshold_spin.setValue(self.config['rate_limit'].get('empty_probe_threshold', 30))
+        self.empty_threshold_spin.setFont(QFont('Arial', 11))
+        self.empty_threshold_spin.setToolTip(
+            "单账号连续 N 次空返回时触发探针确诊。\n"
+            "低命中率号包（<20%）建议 30–50，高命中率（>50%）可设 15–20。"
+        )
+        form.addRow("空返探针阈值:", self.empty_threshold_spin)
 
         layout.addLayout(form)
 
@@ -2533,6 +2691,7 @@ class TelegramFilterGUI(QMainWindow):
         self.config['rate_limit']['requests_per_account'] = self.req_spin.value()
         self.config['rate_limit']['min_delay'] = self.min_spin.value()
         self.config['rate_limit']['max_delay'] = self.max_spin.value()
+        self.config['rate_limit']['empty_probe_threshold'] = self.empty_threshold_spin.value()
         self.config['primary_count'] = self.primary_count_spin.value()
         save_config(self.config)
         self.refresh_account_table()
